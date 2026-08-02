@@ -1,0 +1,12 @@
+{
+  "name": "local-file-browser",
+  "version": "1.0.0",
+  "description": "本地文件夹文件浏览器 — 支持多个根目录、视频/音频在线播放、PDF 在线查看、其他文件下载",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

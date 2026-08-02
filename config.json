@@ -1,0 +1,30 @@
+{
+  "port": 3002,
+  "cacheTtlSeconds": 60,
+  "roots": [
+    {
+      "name": "视频库",
+      "path": "/Users/zhuhui/Movies"
+    },
+    {
+      "name": "音乐库",
+      "path": "/Users/zhuhui/Music"
+    },
+    {
+      "name": "文档库",
+      "path": "/Users/zhuhui/Documents"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "学习资料",
+      "root": 2,
+      "path": "/学习"
+    },
+    {
+      "name": "视频缓存",
+      "root": 0,
+      "path": "/bilibili"
+    }
+  ]
+}

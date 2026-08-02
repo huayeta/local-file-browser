@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>📂 本地文件浏览器</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #171e2e;
+    --panel2: #1e2740;
+    --border: #2a3554;
+    --text: #e8edf7;
+    --muted: #8b96ad;
+    --accent: #4f8cff;
+    --dir: #ffc44d;
+    --video: #ff6b6b;
+    --audio: #51cf66;
+    --pdf: #ff8787;
+    --image: #66d9e8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 18px; font-weight: 600; white-space: nowrap; }
+  #roots-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-left: 8px; flex: 1; }
+  .root-btn {
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 14px; cursor: pointer; font-size: 13px;
+    transition: all .15s;
+  }
+  .root-btn:hover { border-color: var(--accent); }
+  .root-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* 快捷访问栏（⭐ 直达常用文件夹） */
+  #shortcuts-bar {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    align-items: center; margin-left: 12px; padding-left: 12px;
+    border-left: 1px solid var(--border);
+  }
+  #shortcuts-bar .sc-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .shortcut-btn {
+    background: var(--panel2); color: var(--dir);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 14px; cursor: pointer; font-size: 13px;
+    transition: all .15s;
+  }
+  .shortcut-btn:hover { border-color: var(--dir); transform: translateY(-1px); }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px; }
+  #breadcrumb {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 14px; color: var(--muted);
+    margin-bottom: 14px; flex-wrap: wrap;
+  }
+  #breadcrumb .crumb { color: var(--accent); cursor: pointer; }
+  #breadcrumb .crumb:hover { text-decoration: underline; }
+  #breadcrumb .sep { color: var(--muted); }
+  #breadcrumb .cur { color: var(--text); }
+  #back-btn {
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 4px 12px;
+    cursor: pointer; font-size: 13px; margin-right: 4px;
+  }
+  #back-btn:hover { border-color: var(--accent); }
+  #file-list { list-style: none; }
+  .item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 10px;
+    margin-bottom: 8px; cursor: pointer; transition: all .15s;
+  }
+  .item:hover { border-color: var(--accent); background: var(--panel2); transform: translateX(2px); }
+  .item .icon { font-size: 22px; width: 30px; text-align: center; flex-shrink: 0; }
+  .item .name { flex: 1; font-size: 14px; word-break: break-all; }
+  .item .meta { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .item.dir .name { color: var(--dir); font-weight: 600; }
+  .item.video .name { color: var(--video); }
+  .item.audio .name { color: var(--audio); }
+  .item.pdf .name { color: var(--pdf); }
+  .item.image .name { color: var(--image); }
+  .item.text .name { color: var(--accent); }
+  .empty { text-align: center; color: var(--muted); padding: 40px; }
+  #loading { text-align: center; color: var(--muted); padding: 40px; }
+
+  /* 播放器浮层 */
+  #player-overlay {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+    background: rgba(10, 14, 24, .95);
+    border-top: 1px solid var(--border);
+    padding: 12px 20px; display: none;
+  }
+  #player-overlay.show { display: block; }
+  #player-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  #player-title { font-size: 13px; color: var(--text); flex: 1; word-break: break-all; }
+  #player-close {
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 3px 10px;
+    cursor: pointer; font-size: 12px;
+  }
+  #player-close:hover { color: #fff; border-color: var(--accent); }
+  #player-overlay video, #player-overlay audio { width: 100%; max-height: 55vh; border-radius: 8px; background: #000; }
+  #player-overlay audio { height: 46px; }
+  #player-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  /* 文本预览浮层 */
+  #text-overlay {
+    position: fixed; left: 0; right: 0; bottom: 0; top: 0; z-index: 100;
+    background: rgba(10, 14, 24, .96);
+    border-top: 1px solid var(--border);
+    padding: 12px 20px 20px; display: none; flex-direction: column;
+  }
+  #text-overlay.show { display: flex; }
+  #text-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  #text-title { font-size: 13px; color: var(--text); flex: 1; word-break: break-all; }
+  #text-close {
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 3px 10px;
+    cursor: pointer; font-size: 12px;
+  }
+  #text-close:hover { color: #fff; border-color: var(--accent); }
+  #text-content {
+    flex: 1; overflow: auto; margin: 0; padding: 14px;
+    background: #0a0e18; border: 1px solid var(--border); border-radius: 8px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+    line-height: 1.6; color: #d5dcec; white-space: pre-wrap; word-break: break-all;
+  }
+  #text-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📂 本地文件浏览器</h1>
+  <div id="roots-bar"><span style="color:var(--muted);font-size:13px">加载根目录...</span></div>
+  <div id="shortcuts-bar" style="display:none"></div>
+</header>
+
+<main>
+  <div id="breadcrumb"></div>
+  <div id="loading">加载中...</div>
+  <ul id="file-list"></ul>
+</main>
+
+<!-- 播放器浮层 -->
+<div id="player-overlay">
+  <div id="player-head">
+    <span id="player-title"></span>
+    <button id="player-close">✕ 关闭</button>
+  </div>
+  <video id="player-video" controls preload="auto" style="display:none"></video>
+  <audio id="player-audio" controls preload="auto" style="display:none"></audio>
+  <div id="player-hint"></div>
+</div>
+
+<!-- 文本预览浮层 -->
+<div id="text-overlay">
+  <div id="text-head">
+    <span id="text-title"></span>
+    <button id="text-close">✕ 关闭</button>
+  </div>
+  <pre id="text-content">加载中...</pre>
+  <div id="text-hint"></div>
+</div>
+
+<script>
+// ============================================================
+// 全局状态
+// ============================================================
+let roots = [];        // 配置的根目录
+let currentRoot = 0;   // 当前根目录索引
+let currentPath = '';  // 当前相对路径（根目录内）
+let entries = [];      // 当前列表
+
+const $ = id => document.getElementById(id);
+const fileListEl = $('file-list');
+const breadcrumbEl = $('breadcrumb');
+const loadingEl = $('loading');
+
+// 文件图标
+const ICONS = {
+  dir: '📁', video: '🎬', audio: '🎵', pdf: '📄', image: '🖼️', text: '📝', file: '📦', hidden: '🔒',
+};
+
+// ============================================================
+// URL hash 路由：把导航状态（根目录 + 路径）写入 URL，
+// 刷新后从 hash 恢复，不再回到主页；支持浏览器前进/后退
+//   格式: #/rootIndex/path1/path2
+// ============================================================
+function encodeState() {
+  const segs = currentPath.split('/').filter(Boolean).map(encodeURIComponent);
+  return '#/' + currentRoot + (segs.length ? '/' + segs.join('/') : '');
+}
+
+function parseHash() {
+  const m = /^#\/(\d+)(?:\/(.*))?$/.exec(location.hash || '');
+  if (!m) return { root: 0, path: '' };
+  const root = parseInt(m[1], 10);
+  let path = '';
+  if (m[2] !== undefined) {
+    try {
+      path = '/' + m[2].split('/').map(decodeURIComponent).join('/');
+    } catch (e) { return { root: 0, path: '' }; }
+  }
+  return { root, path };
+}
+
+// 导航成功后把状态写入 URL（pushState 产生历史记录，支持后退）
+function syncUrl() {
+  const target = encodeState();
+  if (location.hash !== target) {
+    history.pushState(null, '', target);
+  }
+}
+
+// ============================================================
+// 滚动位置记忆（sessionStorage）：刷新后回到之前的滚动位置
+// ============================================================
+const SCROLL_KEY = 'lfb-scroll-loc';
+const SCROLL_POS_KEY = 'lfb-scroll-pos';
+
+function saveScrollState() {
+  try {
+    sessionStorage.setItem(SCROLL_KEY, currentRoot + ':' + currentPath);
+    sessionStorage.setItem(SCROLL_POS_KEY, String(window.scrollY || 0));
+  } catch (e) { /* 隐私模式禁用 sessionStorage 时忽略 */ }
+}
+
+function restoreScrollState() {
+  try {
+    const loc = sessionStorage.getItem(SCROLL_KEY);
+    if (loc === currentRoot + ':' + currentPath) {
+      window.scrollTo(0, parseInt(sessionStorage.getItem(SCROLL_POS_KEY) || '0', 10));
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// ============================================================
+// 根目录加载
+// ============================================================
+async function loadRoots() {
+  try {
+    const res = await fetch('/api/roots');
+    const data = await res.json();
+    roots = data.roots || [];
+    const bar = $('roots-bar');
+    bar.innerHTML = '';
+    roots.forEach(r => {
+      const btn = document.createElement('button');
+      btn.className = 'root-btn' + (r.index === currentRoot ? ' active' : '');
+      btn.textContent = r.name;
+      btn.onclick = () => switchRoot(r.index);
+      bar.appendChild(btn);
+    });
+    if (roots.length === 0) {
+      bar.innerHTML = '<span style="color:#ff8787">⚠️ 未配置任何根目录</span>';
+    }
+
+    // 渲染快捷访问栏（⭐ 直达常用文件夹）
+    renderShortcuts(data.shortcuts || []);
+
+    // 从 URL hash 恢复导航位置（刷新/直接访问链接时不再回主页）
+    const st = parseHash();
+    if (roots[st.root]) {
+      currentRoot = st.root;
+      currentPath = st.path;
+      document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === st.root));
+    }
+
+    loadList();
+  } catch (e) {
+    console.error(e);
+    bar.innerHTML = '<span style="color:#ff8787">⚠️ 加载根目录失败</span>';
+  }
+}
+
+function switchRoot(idx) {
+  if (idx === currentRoot) return;
+  saveScrollState();  // 记录离开前的滚动位置
+  currentRoot = idx;
+  currentPath = '';
+  document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === idx));
+  loadList();
+}
+
+// ============================================================
+// 快捷访问栏：⭐ 直达配置的常用文件夹
+// ============================================================
+function renderShortcuts(list) {
+  const bar = $('shortcuts-bar');
+  bar.innerHTML = '';
+  if (!list || list.length === 0) {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  const label = document.createElement('span');
+  label.className = 'sc-label';
+  label.textContent = '⭐ 快捷';
+  bar.appendChild(label);
+  list.forEach(s => {
+    const btn = document.createElement('button');
+    btn.className = 'shortcut-btn';
+    btn.textContent = s.name;
+    btn.title = '直达: ' + (roots[s.root] ? roots[s.root].name : '?') + s.path;
+    btn.onclick = () => jumpToShortcut(s);
+    bar.appendChild(btn);
+  });
+}
+
+// 跳到快捷文件夹（复用现有导航：同步 URL、滚动记忆、缓存均生效）
+function jumpToShortcut(s) {
+  if (s.root === currentRoot && s.path === currentPath) return;
+  saveScrollState();
+  currentRoot = s.root;
+  currentPath = s.path;
+  document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === s.root));
+  loadList();
+}
+
+// ============================================================
+// 文件列表加载
+// ============================================================
+async function loadList() {
+  loadingEl.style.display = 'block';
+  fileListEl.innerHTML = '';
+  breadcrumbEl.innerHTML = '';
+  try {
+    const qs = new URLSearchParams({ root: currentRoot, path: currentPath });
+    const res = await fetch('/api/list?' + qs.toString());
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || ('HTTP ' + res.status));
+    }
+    const data = await res.json();
+    entries = data.entries || [];
+    renderBreadcrumb(data.current ? data.current.path : currentPath);
+    renderList();
+    // 加载成功：同步 URL（hash）并恢复上次滚动位置（若有）
+    syncUrl();
+    restoreScrollState();
+  } catch (e) {
+    loadingEl.style.display = 'none';
+    fileListEl.innerHTML = `<li class="empty">❌ 加载失败: ${e.message}</li>`;
+  }
+}
+
+function renderBreadcrumb(pathStr) {
+  // 面包屑: 根 / a / b
+  breadcrumbEl.innerHTML = '';
+  if (currentPath) {
+    const back = document.createElement('button');
+    back.id = 'back-btn';
+    back.textContent = '← 返回';
+    back.onclick = () => goUp();
+    breadcrumbEl.appendChild(back);
+  }
+  const parts = (pathStr === '/' ? '' : pathStr).split('/').filter(Boolean);
+  const addCrumb = (label, idx) => {
+    const c = document.createElement('span');
+    c.className = 'crumb';
+    c.textContent = label;
+    c.onclick = () => { saveScrollState(); currentPath = parts.slice(0, idx).join('/'); loadList(); };
+    breadcrumbEl.appendChild(c);
+  };
+  addCrumb('📁 ' + (roots[currentRoot] ? roots[currentRoot].name : '根目录'), 0);
+  parts.forEach((p, i) => {
+    const sep = document.createElement('span');
+    sep.className = 'sep';
+    sep.textContent = ' / ';
+    breadcrumbEl.appendChild(sep);
+    if (i === parts.length - 1) {
+      const cur = document.createElement('span');
+      cur.className = 'cur';
+      cur.textContent = p;
+      breadcrumbEl.appendChild(cur);
+    } else {
+      addCrumb(p, i + 1);
+    }
+  });
+}
+
+function goUp() {
+  saveScrollState();  // 记录离开前的滚动位置
+  currentPath = currentPath.split('/').filter(Boolean).slice(0, -1).join('/');
+  loadList();
+}
+
+function formatSize(bytes) {
+  if (!bytes && bytes !== 0) return '';
+  if (bytes < 1024) return bytes + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = bytes, u = -1;
+  do { v /= 1024; u++; } while (v >= 1024 && u < units.length - 1);
+  return v.toFixed(1) + ' ' + units[u];
+}
+
+function renderList() {
+  loadingEl.style.display = 'none';
+  fileListEl.innerHTML = '';
+  if (entries.length === 0) {
+    fileListEl.innerHTML = '<li class="empty">📂 此文件夹为空</li>';
+    return;
+  }
+  entries.forEach(e => {
+    const li = document.createElement('li');
+    li.className = 'item ' + e.kind;
+    li.innerHTML = `
+      <span class="icon">${ICONS[e.kind] || '📦'}</span>
+      <span class="name">${escapeHtml(e.name)}</span>
+      <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
+    `;
+    li.onclick = () => handleClick(e);
+    fileListEl.appendChild(li);
+  });
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+// ============================================================
+// 点击行为
+//   文件夹 → 进入
+//   视频/音频 → 浮层播放
+//   PDF/图片 → 新标签页在线查看
+//   其他 → 下载
+// ============================================================
+function fileUrl(e) {
+  const qs = new URLSearchParams({ root: currentRoot, path: e.path });
+  return '/file?' + qs.toString();
+}
+
+function handleClick(e) {
+  if (e.kind === 'hidden') return;
+  if (e.isDir) {
+    saveScrollState();  // 记录离开前的滚动位置
+    currentPath = e.path;
+    loadList();
+    return;
+  }
+  if (e.kind === 'video' || e.kind === 'audio') {
+    openPlayer(e);
+  } else if (e.kind === 'pdf' || e.kind === 'image') {
+    window.open(fileUrl(e), '_blank'); // 浏览器内置 PDF 阅读器 / 图片查看
+  } else if (e.kind === 'text') {
+    openTextPreview(e);
+  } else {
+    // 其他文件 → 下载
+    const a = document.createElement('a');
+    a.href = fileUrl(e);
+    a.download = e.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+}
+
+// ============================================================
+// 播放器浮层
+// ============================================================
+const overlay = $('player-overlay');
+const videoEl = $('player-video');
+const audioEl = $('player-audio');
+
+function openPlayer(e) {
+  const url = fileUrl(e);
+  $('player-title').textContent = (e.kind === 'video' ? '🎬 ' : '🎵 ') + e.name;
+  $('player-hint').textContent = '';
+  videoEl.pause(); audioEl.pause();
+  if (e.kind === 'video') {
+    videoEl.style.display = 'block';
+    audioEl.style.display = 'none';
+    videoEl.src = url;
+    videoEl.play().catch(() => {});
+  } else {
+    audioEl.style.display = 'block';
+    videoEl.style.display = 'none';
+    audioEl.src = url;
+    audioEl.play().catch(() => {});
+  }
+  overlay.classList.add('show');
+  overlay.scrollIntoView({ behavior: 'smooth', block: 'end' });
+}
+
+function closePlayer() {
+  videoEl.pause(); videoEl.src = '';
+  audioEl.pause(); audioEl.src = '';
+  overlay.classList.remove('show');
+}
+
+$('player-close').onclick = closePlayer;
+
+// 视频播放失败提示（如浏览器不支持的编码格式，可提示下载）
+videoEl.addEventListener('error', () => {
+  const msg = '⚠️ 该视频格式浏览器无法直接播放（编码不支持），可点击列表再次选择或换用支持 MP4/H.264 的文件。';
+  $('player-hint').textContent = msg;
+});
+audioEl.addEventListener('error', () => {
+  $('player-hint').textContent = '⚠️ 该音频格式浏览器无法直接播放。';
+});
+
+// ============================================================
+// 文本预览
+// ============================================================
+const textOverlay = $('text-overlay');
+const textContentEl = $('text-content');
+const TEXT_PREVIEW_MAX = 2 * 1024 * 1024; // 超过 2MB 不预览，提示下载
+
+async function openTextPreview(e) {
+  if (e.size > TEXT_PREVIEW_MAX) {
+    alert('文件较大（' + formatSize(e.size) + '），已为你下载。');
+    const a = document.createElement('a');
+    a.href = fileUrl(e);
+    a.download = e.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return;
+  }
+  $('text-title').textContent = '📝 ' + e.name;
+  $('text-hint').textContent = '';
+  textContentEl.textContent = '加载中...';
+  textOverlay.classList.add('show');
+  try {
+    const res = await fetch(fileUrl(e));
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    textContentEl.textContent = text;
+  } catch (err) {
+    textContentEl.textContent = '';
+    $('text-hint').textContent = '❌ 加载失败: ' + err.message;
+  }
+}
+
+function closeTextPreview() {
+  textOverlay.classList.remove('show');
+  textContentEl.textContent = '';
+}
+
+$('text-close').onclick = closeTextPreview;
+
+// 键盘 Esc 关闭浮层（播放器或文本预览）
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (textOverlay.classList.contains('show')) closeTextPreview();
+  else closePlayer();
+});
+
+// 刷新/关闭页面时保存滚动位置（供刷新后恢复）
+window.addEventListener('pagehide', saveScrollState);
+
+// ============================================================
+// 浏览器前进/后退（popstate）或手动改 URL hash（hashchange）
+// ============================================================
+function applyUrlState() {
+  const st = parseHash();
+  // 状态未变则跳过（popstate 与 hashchange 可能同时触发，避免重复加载）
+  if (st.root === currentRoot && st.path === currentPath) return;
+  // 非法 root 索引回退到主页
+  if (!roots[st.root]) {
+    currentRoot = 0;
+    currentPath = '';
+  } else {
+    currentRoot = st.root;
+    currentPath = st.path;
+  }
+  document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === currentRoot));
+  loadList();
+}
+window.addEventListener('popstate', applyUrlState);
+window.addEventListener('hashchange', applyUrlState);
+
+// ============================================================
+// 启动
+// ============================================================
+loadRoots();
+</script>
+</body>
+</html>
