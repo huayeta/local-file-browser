@@ -351,7 +351,9 @@ function matchScore(normName, keywords) {
 
 // 递归搜索；ctx: { rootFull, keywords, cancelled, timedOut, results }
 async function searchWalk(ctx, absDir, relDir, depth) {
-  if (ctx.cancelled || ctx.timedOut || ctx.results.length >= SEARCH_MAX_RESULTS) return;
+  // 遍历只受取消/超时/深度限制，不因结果数量提前终止——
+  // 否则结果多的目录会截断遍历，导致其后目录里的文件/文件夹搜不到
+  if (ctx.cancelled || ctx.timedOut) return;
   if (depth > SEARCH_MAX_DEPTH) return;
 
   let dirents;
@@ -360,7 +362,7 @@ async function searchWalk(ctx, absDir, relDir, depth) {
   } catch (e) { return; } // 目录不可读则跳过
 
   for (const ent of dirents) {
-    if (ctx.cancelled || ctx.timedOut || ctx.results.length >= SEARCH_MAX_RESULTS) return;
+    if (ctx.cancelled || ctx.timedOut) return;
     const name = ent.name;
     // 跳过隐藏项（.开头、.DS_Store、回收站等）
     if (name.startsWith('.') || name === '$RECYCLE.BIN') continue;
@@ -436,7 +438,8 @@ function apiSearch(req, res, url) {
       return a.path.localeCompare(b.path, 'zh-CN');
     });
 
-    const truncated = ctx.timedOut || ctx.results.length >= SEARCH_MAX_RESULTS;
+    // 遍历已完整执行：仅当超时或结果确实超过上限时才标记截断
+    const truncated = ctx.timedOut || ctx.results.length > SEARCH_MAX_RESULTS;
     const results = ctx.results.slice(0, SEARCH_MAX_RESULTS).map(({ score, ...rest }) => rest);
 
     sendJson(res, 200, {
