@@ -277,29 +277,51 @@ const ICONS = {
 // ============================================================
 // URL hash 路由：把导航状态（根目录 + 路径）写入 URL，
 // 刷新后从 hash 恢复，不再回到主页；支持浏览器前进/后退
-//   格式: #/rootIndex/path1/path2
+//   目录格式: #/rootIndex/path1/path2
+//   搜索格式: #s/rootIndex/关键词（搜索状态也纳入历史，返回可恢复）
 // ============================================================
 function encodeState() {
   const segs = currentPath.split('/').filter(Boolean).map(encodeURIComponent);
   return '#/' + currentRoot + (segs.length ? '/' + segs.join('/') : '');
 }
 
+function encodeSearchState(q) {
+  return '#s/' + currentRoot + '/' + encodeURIComponent(q);
+}
+
 function parseHash() {
-  const m = /^#\/(\d+)(?:\/(.*))?$/.exec(location.hash || '');
-  if (!m) return { root: 0, path: '' };
+  const h = location.hash || '';
+  // 搜索状态：#s/root/q
+  const sm = /^#s\/(\d+)\/(.*)$/.exec(h);
+  if (sm) {
+    let q = '';
+    try { q = decodeURIComponent(sm[2]); } catch (e) { /* 解码失败则空词 */ }
+    return { search: true, root: parseInt(sm[1], 10) || 0, q };
+  }
+  // 目录状态：#/root/path
+  const m = /^#\/(\d+)(?:\/(.*))?$/.exec(h);
+  if (!m) return { search: false, root: 0, path: '' };
   const root = parseInt(m[1], 10);
   let path = '';
   if (m[2] !== undefined) {
     try {
       path = '/' + m[2].split('/').map(decodeURIComponent).join('/');
-    } catch (e) { return { root: 0, path: '' }; }
+    } catch (e) { return { search: false, root: 0, path: '' }; }
   }
-  return { root, path };
+  return { search: false, root, path };
 }
 
 // 导航成功后把状态写入 URL（pushState 产生历史记录，支持后退）
 function syncUrl() {
   const target = encodeState();
+  if (location.hash !== target) {
+    history.pushState(null, '', target);
+  }
+}
+
+// 搜索成功后把搜索状态写入 URL（进入文件夹后再返回，可回到搜索页）
+function syncSearchUrl(q) {
+  const target = encodeSearchState(q);
   if (location.hash !== target) {
     history.pushState(null, '', target);
   }
@@ -323,6 +345,23 @@ function restoreScrollState() {
     const loc = sessionStorage.getItem(SCROLL_KEY);
     if (loc === currentRoot + ':' + currentPath) {
       window.scrollTo(0, parseInt(sessionStorage.getItem(SCROLL_POS_KEY) || '0', 10));
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// 搜索结果的滚动位置记忆（按关键词绑定，返回搜索页时还原）
+const SEARCH_SCROLL_KEY = 'lfb-search-scroll';
+function saveSearchScroll(q) {
+  try {
+    sessionStorage.setItem(SEARCH_SCROLL_KEY, JSON.stringify({ q, y: window.scrollY || 0 }));
+  } catch (e) { /* ignore */ }
+}
+function restoreSearchScroll(q) {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(SEARCH_SCROLL_KEY) || 'null');
+    if (saved && saved.q === q) {
+      window.scrollTo(0, saved.y || 0);
+      sessionStorage.removeItem(SEARCH_SCROLL_KEY);
     }
   } catch (e) { /* ignore */ }
 }
@@ -355,11 +394,18 @@ async function loadRoots() {
     const st = parseHash();
     if (roots[st.root]) {
       currentRoot = st.root;
-      currentPath = st.path;
       document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === st.root));
     }
-
-    loadList();
+    if (st.search) {
+      // 搜索状态：恢复搜索词并重新搜索
+      searchInput.value = st.q || '';
+      if (st.q) { doSearch(st.q); return; }
+      currentPath = '';
+      loadList();
+    } else {
+      currentPath = st.path || '';
+      loadList();
+    }
   } catch (e) {
     console.error(e);
     bar.innerHTML = '<span style="color:#ff8787">⚠️ 加载根目录失败</span>';
@@ -660,6 +706,9 @@ async function doSearch(q) {
     searchResults = data.results || [];
     if (searchResults.length > 0) saveSearchHistory(q);  // 有结果才记历史
     renderSearchResults();
+    restoreSearchScroll(q);  // 返回搜索页时还原之前保存的滚动位置
+    // 搜索状态写入 URL：返回/前进可回到搜索页；若 URL 已是同状态则不再入栈
+    syncSearchUrl(q);
   } catch (err) {
     if (err.name === 'AbortError') return;  // 被更新的请求取消，忽略
     if (seq !== searchSeq) return;
@@ -736,6 +785,8 @@ function renderSearchResults() {
 
 // 点击搜索结果进入目录时：退出搜索模式，跳到该目录
 function enterDirFromSearch(e) {
+  const q = searchInput.value.trim();
+  saveSearchScroll(q);  // 记住当前搜索滚动位置（按关键词，返回时可还原）
   cancelSearch();
   searchInput.value = '';
   searchTypeSel.value = '';
@@ -855,17 +906,31 @@ window.addEventListener('pagehide', saveScrollState);
 // ============================================================
 function applyUrlState() {
   const st = parseHash();
-  // 状态未变则跳过（popstate 与 hashchange 可能同时触发，避免重复加载）
-  if (st.root === currentRoot && st.path === currentPath) return;
   // 非法 root 索引回退到主页
   if (!roots[st.root]) {
     currentRoot = 0;
-    currentPath = '';
+    document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === 0));
   } else {
     currentRoot = st.root;
-    currentPath = st.path;
+    document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === st.root));
   }
-  document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === currentRoot));
+
+  if (st.search) {
+    // 回到搜索状态：恢复关键词并重新搜索（状态未变则跳过，popstate/hashchange 会同时触发）
+    const q = st.q || '';
+    if (searchMode && searchInput.value.trim() === q) return;
+    searchInput.value = q;
+    if (q) { doSearch(q); return; }
+    searchMode = false;
+    searchResults = [];
+    currentPath = '';
+    loadList();
+    return;
+  }
+
+  // 目录状态：状态未变则跳过
+  if (!searchMode && st.path === currentPath) return;
+  currentPath = st.path || '';
   loadList();
 }
 window.addEventListener('popstate', applyUrlState);
