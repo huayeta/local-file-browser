@@ -615,6 +615,36 @@ let searchMode = false;       // 是否处于搜索结果视图
 let searchResults = [];       // 当前搜索结果
 let searchTimer = null;       // 防抖定时器
 
+// 搜索结果内存缓存：返回搜索页时直接出结果，不重复请求后台
+//   key = `${当前根目录}:${关键词}`（搜索结果与根目录强相关）
+//   value = { results, total, truncated, cachedAt }
+const SEARCH_CACHE_TTL_MS = 60 * 1000;  // 60 秒 TTL，文件变化后最多延迟 60s 可见新结果
+const SEARCH_CACHE_MAX = 50;            // 最多缓存 50 条，超出按插入顺序淘汰最旧
+const searchCache = new Map();
+
+function searchCacheKey(q) {
+  return currentRoot + ':' + q;
+}
+
+// 读取缓存：命中且未超 TTL 返回数据，否则返回 null
+function getSearchCache(q) {
+  const key = searchCacheKey(q);
+  const hit = searchCache.get(key);
+  if (hit && Date.now() - hit.cachedAt < SEARCH_CACHE_TTL_MS) {
+    return hit;
+  }
+  return null;
+}
+
+// 写入缓存（超出上限时淘汰最旧一条）
+function setSearchCache(q, data) {
+  searchCache.set(searchCacheKey(q), { ...data, cachedAt: Date.now() });
+  if (searchCache.size > SEARCH_CACHE_MAX) {
+    const oldest = searchCache.keys().next().value;
+    searchCache.delete(oldest);
+  }
+}
+
 // 防抖：停止输入 300ms 后才发起搜索
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
@@ -694,6 +724,17 @@ async function doSearch(q) {
   searchMode = true;
   searchClearBtn.style.display = 'inline-block';
 
+  // 命中缓存：不请求后台，直接渲染结果（返回搜索页时秒出）
+  const cached = getSearchCache(q);
+  if (cached) {
+    if (seq !== searchSeq) return;
+    searchResults = cached.results || [];
+    renderSearchResults();
+    restoreSearchScroll(q);  // 返回搜索页时还原之前保存的滚动位置
+    syncSearchUrl(q);        // 同步 URL（已是同状态则不再入栈）
+    return;
+  }
+
   loadingEl.style.display = 'block';
   fileListEl.innerHTML = '';
   breadcrumbEl.innerHTML = '';
@@ -704,6 +745,7 @@ async function doSearch(q) {
     const data = await res.json();
     if (seq !== searchSeq) return;
     searchResults = data.results || [];
+    setSearchCache(q, { results: searchResults, total: data.total, truncated: data.truncated });
     if (searchResults.length > 0) saveSearchHistory(q);  // 有结果才记历史
     renderSearchResults();
     restoreSearchScroll(q);  // 返回搜索页时还原之前保存的滚动位置
