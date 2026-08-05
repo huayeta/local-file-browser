@@ -4,23 +4,15 @@
   "roots": [
     {
       "name": "视频库",
-      "path": "/Users/zhuhui/Movies"
+      "path": "/path/to/your/movies"
     },
     {
       "name": "音乐库",
-      "path": "/Users/zhuhui/Music"
+      "path": "/path/to/your/music"
     },
     {
       "name": "文档库",
-      "path": "/Users/zhuhui/Documents"
-    },
-    {
-      "name": "下载库",
-      "path": "/Users/zhuhui/Downloads"
-    },
-    {
-      "name": "桌面",
-      "path": "/Users/zhuhui/Desktop"
+      "path": "/path/to/your/documents"
     }
   ],
   "shortcuts": [

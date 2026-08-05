@@ -57,6 +57,30 @@
     transition: all .15s;
   }
   .shortcut-btn:hover { border-color: var(--dir); transform: translateY(-1px); }
+
+  /* 搜索框 */
+  #search-box {
+    display: flex; align-items: center; gap: 6px;
+    margin-left: auto; max-width: 100%;
+  }
+  #search-input {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 6px 10px; font-size: 13px; width: 180px;
+    outline: none; transition: border-color .15s;
+  }
+  #search-input:focus { border-color: var(--accent); }
+  #search-input::placeholder { color: var(--muted); }
+  #search-type {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 5px 6px; font-size: 12px; outline: none; cursor: pointer;
+  }
+  #search-clear {
+    background: none; border: none; color: var(--muted); font-size: 15px;
+    cursor: pointer; padding: 4px 6px; display: none;
+  }
+  #search-clear:hover { color: #fff; }
+  mark { background: var(--dir); color: #1a1a1a; border-radius: 2px; padding: 0 2px; }
+  .search-result-path { font-size: 11px; color: var(--muted); margin-left: 8px; flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   main { max-width: 1000px; margin: 0 auto; padding: 20px; }
   #breadcrumb {
     display: flex; align-items: center; gap: 6px;
@@ -136,6 +160,50 @@
     line-height: 1.6; color: #d5dcec; white-space: pre-wrap; word-break: break-all;
   }
   #text-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  /* ============================================================
+     响应式适配
+     · 769–1024px：窄桌面/平板，紧凑布局
+     · ≤768px：手机，按钮横滑、触屏加大、内容贴边
+  ============================================================ */
+  @media (max-width: 1024px) {
+    header { flex-wrap: wrap; gap: 8px; padding: 10px 14px; }
+    header h1 { font-size: 16px; }
+    #roots-bar { margin-left: 0; flex: 1 1 auto; }
+    #shortcuts-bar { margin-left: 0; padding-left: 0; border-left: none; }
+    main { padding: 14px; }
+    .root-btn, .shortcut-btn { padding: 5px 12px; font-size: 12px; }
+  }
+
+  @media (max-width: 768px) {
+    header { gap: 8px; padding: 10px 12px; }
+    header h1 { width: 100%; }           /* 标题独占一行 */
+    #roots-bar {
+      flex: 1 1 auto; flex-wrap: nowrap; overflow-x: auto;  /* 横滑 */
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      margin-left: 0; padding-bottom: 2px;
+    }
+    #roots-bar::-webkit-scrollbar { display: none; }
+    .root-btn { flex-shrink: 0; }
+    #shortcuts-bar {
+      flex: 1 1 auto; flex-wrap: nowrap; overflow-x: auto;  /* 横滑 */
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      margin-left: 0; padding-left: 0; border-left: none; width: 100%;
+    }
+    #shortcuts-bar::-webkit-scrollbar { display: none; }
+    .shortcut-btn { flex-shrink: 0; }
+    main { padding: 10px 12px; }
+    #breadcrumb { font-size: 13px; margin-bottom: 10px; }
+    #back-btn { padding: 6px 14px; }     /* 触屏加大点击区 */
+    .item { padding: 13px 12px; margin-bottom: 6px; gap: 10px; }
+    .item .icon { font-size: 20px; width: 26px; }
+    .item .name { font-size: 14px; }
+    .item .meta { font-size: 11px; }
+    #player-overlay { padding: 10px 12px; }
+    #text-overlay { padding: 10px 12px 14px; }
+    #text-content { padding: 10px; font-size: 12px; }
+    .empty, #loading { padding: 28px; }
+  }
 </style>
 </head>
 <body>
@@ -144,6 +212,20 @@
   <h1>📂 本地文件浏览器</h1>
   <div id="roots-bar"><span style="color:var(--muted);font-size:13px">加载根目录...</span></div>
   <div id="shortcuts-bar" style="display:none"></div>
+  <div id="search-box">
+    <input id="search-input" type="search" list="search-history-dl" placeholder="🔍 搜索文件..." autocomplete="off">
+    <datalist id="search-history-dl"></datalist>
+    <select id="search-type">
+      <option value="">全部</option>
+      <option value="video">视频</option>
+      <option value="audio">音频</option>
+      <option value="pdf">PDF</option>
+      <option value="image">图片</option>
+      <option value="text">文本</option>
+      <option value="dir">文件夹</option>
+    </select>
+    <button id="search-clear" title="清除搜索">✕</button>
+  </div>
 </header>
 
 <main>
@@ -290,7 +372,13 @@ function switchRoot(idx) {
   currentRoot = idx;
   currentPath = '';
   document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === idx));
-  loadList();
+  // 搜索模式下切换根目录：用当前关键词在新根目录重新搜索
+  const q = searchInput.value.trim();
+  if (searchMode && q) {
+    doSearch(q);
+  } else {
+    loadList();
+  }
 }
 
 // ============================================================
@@ -446,6 +534,7 @@ function fileUrl(e) {
 function handleClick(e) {
   if (e.kind === 'hidden') return;
   if (e.isDir) {
+    if (searchMode) { enterDirFromSearch(e); return; }  // 搜索结果里的文件夹：退出搜索并进入
     saveScrollState();  // 记录离开前的滚动位置
     currentPath = e.path;
     loadList();
@@ -466,6 +555,195 @@ function handleClick(e) {
     a.click();
     a.remove();
   }
+}
+
+// ============================================================
+// 搜索：防抖输入 + AbortController 竞态控制（旧请求取消、旧结果丢弃）
+// ============================================================
+const searchInput = $('search-input');
+const searchTypeSel = $('search-type');
+const searchClearBtn = $('search-clear');
+let searchController = null;  // 当前搜索请求的 AbortController
+let searchSeq = 0;            // 请求序号，防止旧结果晚到覆盖新结果
+let searchMode = false;       // 是否处于搜索结果视图
+let searchResults = [];       // 当前搜索结果
+let searchTimer = null;       // 防抖定时器
+
+// 防抖：停止输入 300ms 后才发起搜索
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = searchInput.value.trim();
+  if (!q) {
+    // 关键词清空：中断搜索并恢复到未搜索的目录视图
+    const wasSearching = searchMode;
+    cancelSearch();
+    searchTypeSel.value = '';
+    if (wasSearching) {
+      searchMode = false;
+      searchResults = [];
+      loadList();
+    }
+    return;
+  }
+  searchTimer = setTimeout(() => doSearch(q), 300);
+});
+
+// 类型过滤变化：若在搜索视图则重新渲染（前端过滤已返回结果）
+searchTypeSel.addEventListener('change', () => {
+  if (searchMode) renderSearchResults();
+});
+
+// 清除搜索：中断请求、清空输入、回到目录视图
+searchClearBtn.addEventListener('click', () => {
+  cancelSearch();
+  searchInput.value = '';
+  searchTypeSel.value = '';
+  if (searchMode) { searchMode = false; searchResults = []; loadList(); }
+});
+
+// 取消/中断当前搜索（换词、清除、切目录时都会触发）
+function cancelSearch() {
+  if (searchController) { searchController.abort(); searchController = null; }
+  searchSeq++;  // 使所有在途结果失效
+  searchClearBtn.style.display = 'none';
+}
+
+// ============================================================
+// 搜索历史（localStorage，最近 10 条，供 datalist 下拉选择）
+// ============================================================
+const SEARCH_HISTORY_KEY = 'lfb-search-history';
+const SEARCH_HISTORY_MAX = 10;
+
+function getSearchHistory() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(SEARCH_HISTORY_KEY) || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+
+function saveSearchHistory(q) {
+  const arr = getSearchHistory().filter(x => x !== q);
+  arr.unshift(q);
+  if (arr.length > SEARCH_HISTORY_MAX) arr.length = SEARCH_HISTORY_MAX;
+  try { localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(arr)); } catch (e) { /* ignore */ }
+  renderSearchHistory();
+}
+
+function renderSearchHistory() {
+  const dl = $('search-history-dl');
+  dl.innerHTML = '';
+  getSearchHistory().forEach(q => {
+    const opt = document.createElement('option');
+    opt.value = q;
+    dl.appendChild(opt);
+  });
+}
+renderSearchHistory();
+
+async function doSearch(q) {
+  if (searchController) searchController.abort();  // 取消上一个请求
+  const controller = new AbortController();
+  searchController = controller;
+  const seq = ++searchSeq;
+  searchMode = true;
+  searchClearBtn.style.display = 'inline-block';
+
+  loadingEl.style.display = 'block';
+  fileListEl.innerHTML = '';
+  breadcrumbEl.innerHTML = '';
+  try {
+    const qs = new URLSearchParams({ root: currentRoot, q });
+    const res = await fetch('/api/search?' + qs.toString(), { signal: controller.signal });
+    if (seq !== searchSeq) return;  // 已有更新的请求，丢弃本次结果
+    const data = await res.json();
+    if (seq !== searchSeq) return;
+    searchResults = data.results || [];
+    if (searchResults.length > 0) saveSearchHistory(q);  // 有结果才记历史
+    renderSearchResults();
+  } catch (err) {
+    if (err.name === 'AbortError') return;  // 被更新的请求取消，忽略
+    if (seq !== searchSeq) return;
+    loadingEl.style.display = 'none';
+    fileListEl.innerHTML = `<li class="empty">❌ 搜索失败: ${err.message}</li>`;
+  } finally {
+    if (searchController === controller) searchController = null;
+  }
+}
+
+// 高亮文件名中匹配关键词的部分（前端过滤后的结果同样高亮）
+function highlightMatch(name) {
+  const words = (searchInput.value || '').trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return escapeHtml(name);
+  let html = escapeHtml(name);
+  for (const w of words) {
+    // 大小写不敏感高亮；用占位避免替换后再次匹配到已插入的标签
+    const re = new RegExp(escapeRegExp(w), 'gi');
+    html = html.replace(re, m => `\u0000${m}\u0001`);
+  }
+  // 把占位符转成 <mark> 标签
+  return html.replace(/\u0000/g, '<mark>').replace(/\u0001/g, '</mark>');
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// 缩短路径显示：去掉文件名本身，只保留所在目录最后两层，前段用 … 省略
+function shortenPath(p) {
+  if (!p) return '';
+  const parts = p.split('/').filter(Boolean);
+  parts.pop(); // 去掉文件名（文件名已单独显示）
+  if (parts.length === 0) return '/';  // 文件就在根目录下
+  const tail = parts.slice(-2);
+  return (parts.length > 2 ? '…/' : '/') + tail.join('/');
+}
+
+// 渲染搜索结果视图：类型过滤（前端过滤已返回结果）+ 高亮 + 路径
+function renderSearchResults() {
+  loadingEl.style.display = 'none';
+  fileListEl.innerHTML = '';
+
+  const type = searchTypeSel.value;
+  const list = type ? searchResults.filter(r => r.kind === type) : searchResults;
+
+  if (list.length === 0) {
+    fileListEl.innerHTML = `<li class="empty">🔍 未找到匹配的文件${type ? '（类型: ' + type + '）' : ''}</li>`;
+    return;
+  }
+
+  // 结果统计条
+  const stat = document.createElement('li');
+  stat.className = 'empty';
+  stat.style.fontSize = '13px';
+  stat.style.padding = '10px';
+  stat.style.textAlign = 'left';
+  stat.textContent = `🔍 找到 ${searchResults.length} 个结果${type ? `（显示 ${list.length} 个 ${type}）` : ''}${searchResults.length >= 200 ? '，结果过多建议细化关键词' : ''}`;
+  fileListEl.appendChild(stat);
+
+  list.forEach(e => {
+    const li = document.createElement('li');
+    li.className = 'item ' + e.kind;
+    li.innerHTML = `
+      <span class="icon">${ICONS[e.kind] || '📦'}</span>
+      <span class="name">${highlightMatch(e.name)}</span>
+      <span class="search-result-path" title="${escapeHtml(e.isDir ? '' : e.path)}">${escapeHtml(e.isDir ? '' : shortenPath(e.path))}</span>
+      <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
+    `;
+    li.onclick = () => handleClick(e);
+    fileListEl.appendChild(li);
+  });
+}
+
+// 点击搜索结果进入目录时：退出搜索模式，跳到该目录
+function enterDirFromSearch(e) {
+  cancelSearch();
+  searchInput.value = '';
+  searchTypeSel.value = '';
+  searchMode = false;
+  searchResults = [];
+  saveScrollState();
+  currentPath = e.path;
+  loadList();
 }
 
 // ============================================================
@@ -519,6 +797,16 @@ const textOverlay = $('text-overlay');
 const textContentEl = $('text-content');
 const TEXT_PREVIEW_MAX = 2 * 1024 * 1024; // 超过 2MB 不预览，提示下载
 
+// 编码探测：优先按 UTF-8 严格解码；失败（含非法字节序列）则回退 GBK/GB18030
+// （Windows 上常见的 GBK 编码 txt 文件，按 UTF-8 解码会乱码）
+function decodeTextBytes(buf) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch (e) {
+    return new TextDecoder('gbk').decode(buf);
+  }
+}
+
 async function openTextPreview(e) {
   if (e.size > TEXT_PREVIEW_MAX) {
     alert('文件较大（' + formatSize(e.size) + '），已为你下载。');
@@ -537,8 +825,8 @@ async function openTextPreview(e) {
   try {
     const res = await fetch(fileUrl(e));
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const text = await res.text();
-    textContentEl.textContent = text;
+    const buf = await res.arrayBuffer();
+    textContentEl.textContent = decodeTextBytes(buf);
   } catch (err) {
     textContentEl.textContent = '';
     $('text-hint').textContent = '❌ 加载失败: ' + err.message;

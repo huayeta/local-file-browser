@@ -1,6 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { URL } = require('url');
 
 // ============================================================
@@ -320,6 +321,139 @@ function apiList(req, res, url) {
 }
 
 // ============================================================
+// API: /api/search?root=<i>&q=<关键词> — 递归搜索
+//   特性：跳过符号链接（防死循环）、多关键词 AND、全角/大小写归一化、
+//         匹配度排序、结果/深度上限、整体超时、客户端取消感知
+// ============================================================
+const SEARCH_MAX_DEPTH = 8;        // 最大递归深度
+const SEARCH_MAX_RESULTS = 200;    // 结果上限
+const SEARCH_TIMEOUT_MS = 3000;    // 整体超时（毫秒）
+
+// 归一化：转小写 + 全角→半角 + 全角空格→半角
+function normalizeText(s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/[\uFF01-\uFF5E]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/\u3000/g, ' ');
+}
+
+// 匹配度打分：全名包含 > 前缀 > 子串（多词取总分，含 0 即不匹配）
+function matchScore(normName, keywords) {
+  let score = 0;
+  for (const kw of keywords) {
+    if (normName === kw) score += 4;
+    else if (normName.startsWith(kw)) score += 3;
+    else if (normName.includes(kw)) score += 1;
+    else return 0;
+  }
+  return score;
+}
+
+// 递归搜索；ctx: { rootFull, keywords, cancelled, timedOut, results }
+async function searchWalk(ctx, absDir, relDir, depth) {
+  if (ctx.cancelled || ctx.timedOut || ctx.results.length >= SEARCH_MAX_RESULTS) return;
+  if (depth > SEARCH_MAX_DEPTH) return;
+
+  let dirents;
+  try {
+    dirents = await fs.promises.readdir(absDir, { withFileTypes: true });
+  } catch (e) { return; } // 目录不可读则跳过
+
+  for (const ent of dirents) {
+    if (ctx.cancelled || ctx.timedOut || ctx.results.length >= SEARCH_MAX_RESULTS) return;
+    const name = ent.name;
+    // 跳过隐藏项（.开头、.DS_Store、回收站等）
+    if (name.startsWith('.') || name === '$RECYCLE.BIN') continue;
+    // 符号链接不进入：防环、防越界、防重复遍历
+    if (ent.isSymbolicLink()) continue;
+
+    const isDir = ent.isDirectory();
+    const childRel = relDir ? relDir + '/' + name : name;
+    const normName = normalizeText(name);
+    const score = matchScore(normName, ctx.keywords);
+
+    if (score > 0) {
+      const childFull = path.join(absDir, name);
+      let size = 0, mtime = null;
+      try {
+        const s = fs.statSync(childFull);
+        size = isDir ? 0 : s.size;
+        mtime = s.mtime;
+      } catch (e) { /* ignore */ }
+      ctx.results.push({
+        name,
+        isDir,
+        kind: isDir ? 'dir' : classify(name),
+        size,
+        mtime: mtime ? mtime.toISOString() : null,
+        path: '/' + childRel,
+        score,
+      });
+    }
+
+    if (isDir) {
+      await searchWalk(ctx, path.join(absDir, name), childRel, depth + 1);
+    }
+  }
+}
+
+function apiSearch(req, res, url) {
+  const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
+  const root = CONFIG.roots[rootIndex];
+  if (!root) return sendJson(res, 400, { error: `无效的 root 索引: ${rootIndex}` });
+
+  const q = (url.searchParams.get('q') || '').trim();
+  if (!q) {
+    return sendJson(res, 200, { query: '', root: { index: rootIndex, name: root.name }, total: 0, truncated: false, results: [] });
+  }
+
+  const resolved = resolveWithinRoot(root, '');
+  if (!resolved.ok) return sendJson(res, resolved.status, { error: resolved.error });
+
+  // 客户端取消感知：刷新/换关键词/关页面 → 请求断开 → 停止遍历
+  let cancelled = false;
+  res.on('close', () => { cancelled = true; });
+
+  const ctx = {
+    rootFull: resolved.full,
+    keywords: q.split(/\s+/).filter(Boolean).map(normalizeText),
+    cancelled: false,
+    timedOut: false,
+    results: [],
+  };
+
+  const timer = setTimeout(() => { ctx.timedOut = true; }, SEARCH_TIMEOUT_MS);
+
+  (async () => {
+    await searchWalk(ctx, ctx.rootFull, '', 0);
+    clearTimeout(timer);
+    if (cancelled) return; // 客户端已断开，不再写响应
+
+    ctx.results.sort((a, b) => {
+      // 文件夹优先，其次匹配度，再按路径
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      if (b.score !== a.score) return b.score - a.score;
+      return a.path.localeCompare(b.path, 'zh-CN');
+    });
+
+    const truncated = ctx.timedOut || ctx.results.length >= SEARCH_MAX_RESULTS;
+    const results = ctx.results.slice(0, SEARCH_MAX_RESULTS).map(({ score, ...rest }) => rest);
+
+    sendJson(res, 200, {
+      query: q,
+      root: { index: rootIndex, name: root.name, path: root.path },
+      total: results.length,
+      truncated,
+      results,
+    });
+  })().catch(err => {
+    clearTimeout(timer);
+    console.error('搜索错误:', err.message);
+    if (!cancelled) sendJson(res, 500, { error: '搜索失败' });
+  });
+}
+
+// ============================================================
 // 文件服务: /file?root=<i>&path=<rel>
 //   视频/音频 → 支持 Range 206 分片（可拖动进度条）
 //   PDF/图片  → inline 在线查看
@@ -480,6 +614,8 @@ const server = http.createServer((req, res) => {
         : { ok: false, error: '配置重载失败，请检查 config.json（服务保留旧配置）' });
     } else if (p === '/api/list') {
       apiList(req, res, url);
+    } else if (p === '/api/search') {
+      apiSearch(req, res, url);
     } else if (p === '/file') {
       serveFile(req, res, url);
     } else {
@@ -495,12 +631,36 @@ const server = http.createServer((req, res) => {
   }
 });
 
+// ============================================================
+// 获取本机内网 IPv4 地址（供局域网访问）
+// ============================================================
+function getLanIPs() {
+  const ips = [];
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+      for (const iface of ifaces[name]) {
+        // 只取 IPv4 且非回环地址（127.x.x.x）
+        if (iface.family === 'IPv4' && !iface.internal) {
+          ips.push(iface.address);
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return ips;
+}
+
 server.listen(PORT, () => {
+  const lanIPs = getLanIPs();
+  const lanLine = lanIPs.length > 0
+    ? lanIPs.map(ip => `  局域网: http://${ip}:${PORT}`).join('\n')
+    : '  局域网: (未检测到内网 IP)';
   console.log(`
 ==================================================
   📂 本地文件浏览器已启动
 
   访问: http://localhost:${PORT}
+${lanLine}
 
   根目录 (${CONFIG.roots.length}):
 ${CONFIG.roots.map((r, i) => `    [${i}] ${r.name} → ${r.path}`).join('\n')}
