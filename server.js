@@ -591,6 +591,17 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = url.pathname;
 
+  // 请求日志（可配置：config.json 的 logRequests，默认开启）
+  // 响应完成后打印：时间 方法 URL -> 状态码 (耗时)
+  if (CONFIG.logRequests !== false) {
+    const start = Date.now();
+    res.on('finish', () => {
+      console.log(
+        `${new Date().toLocaleTimeString()} ${req.method} ${url.pathname}${url.search ? url.search : ''} -> ${res.statusCode} (${Date.now() - start}ms)`
+      );
+    });
+  }
+
   // 方法拦截：只允许 GET / HEAD，其余返回 405
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.statusCode = 405;

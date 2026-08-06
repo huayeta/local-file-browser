@@ -1,6 +1,7 @@
 {
   "port": 3002,
   "cacheTtlSeconds": 60,
+  "logRequests": true,
   "roots": [
     {
       "name": "视频库",
