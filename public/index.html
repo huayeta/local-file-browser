@@ -133,8 +133,50 @@
     cursor: pointer; font-size: 12px;
   }
   #player-close:hover { color: #fff; border-color: var(--accent); }
+  #player-fullscreen {
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 3px 10px;
+    cursor: pointer; font-size: 12px;
+  }
+  #player-fullscreen:hover { color: #fff; border-color: var(--accent); }
+  #video-wrap { position: relative; }
+  /* 全屏时右下角的大播放/暂停按钮（bottom 抬高避开原生控制条） */
+  #fs-play-toggle {
+    position: absolute; right: 20px; bottom: 100px;
+    width: 72px; height: 72px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.7);
+    background: rgba(0,0,0,.55); color: #fff;
+    font-size: 30px; line-height: 1; cursor: pointer;
+    display: none; align-items: center; justify-content: center;
+    z-index: 10; transition: background .15s, transform .1s;
+  }
+  #fs-play-toggle:hover { background: rgba(0,0,0,.8); transform: scale(1.08); }
+  #fs-play-toggle:active { transform: scale(.95); }
   #player-overlay video, #player-overlay audio { width: 100%; max-height: 55vh; border-radius: 8px; background: #000; }
   #player-overlay audio { height: 46px; }
+  /* 全屏时视频占满整个容器（覆盖上面的 max-height: 55vh 限制，含 Safari 前缀） */
+  #video-wrap:fullscreen,
+  #video-wrap:-webkit-full-screen {
+    width: 100%; height: 100%;
+  }
+  #video-wrap:fullscreen video,
+  #video-wrap:-webkit-full-screen video {
+    width: 100%; height: 100%; max-height: none;
+    object-fit: contain;
+  }
+  /* 全屏时右上角的退出全屏按钮（触屏无键盘也能退出） */
+  #fs-exit-toggle {
+    position: absolute; right: 20px; top: 20px;
+    width: 56px; height: 56px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.7);
+    background: rgba(0,0,0,.55); color: #fff;
+    font-size: 22px; line-height: 1; cursor: pointer;
+    display: none; align-items: center; justify-content: center;
+    z-index: 10; transition: background .15s, transform .1s;
+  }
+  #fs-exit-toggle:hover { background: rgba(0,0,0,.8); transform: scale(1.08); }
+  /* 隐藏原生控制条的全屏按钮：全屏由我们的按钮控制，避免点击行为异常/退不出 */
+  video::-webkit-media-controls-fullscreen-button { display: none; }
   #player-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
   /* 文本预览浮层 */
@@ -238,9 +280,14 @@
 <div id="player-overlay">
   <div id="player-head">
     <span id="player-title"></span>
+    <button id="player-fullscreen" title="全屏播放">⛶</button>
     <button id="player-close">✕ 关闭</button>
   </div>
-  <video id="player-video" controls preload="auto" style="display:none"></video>
+  <div id="video-wrap">
+    <video id="player-video" controls preload="auto" style="display:none"></video>
+    <button id="fs-exit-toggle" title="退出全屏" style="display:none">⛶</button>
+    <button id="fs-play-toggle" title="播放/暂停" style="display:none">⏸</button>
+  </div>
   <audio id="player-audio" controls preload="auto" style="display:none"></audio>
   <div id="player-hint"></div>
 </div>
@@ -873,6 +920,69 @@ function closePlayer() {
 }
 
 $('player-close').onclick = closePlayer;
+
+// ============================================================
+// 全屏播放：浮窗全屏按钮 + 全屏状态监听（含 Safari 前缀兼容）
+// ============================================================
+const videoWrap = $('video-wrap');
+const fsPlayToggle = $('fs-play-toggle');
+const fsExitToggle = $('fs-exit-toggle');
+const fullscreenBtn = $('player-fullscreen');
+
+function isFullscreen() {
+  return !!(document.fullscreenElement ||
+            document.webkitFullscreenElement ||
+            document.mozFullScreenElement ||
+            document.msFullscreenElement);
+}
+
+function toggleFullscreen() {
+  if (isFullscreen()) {
+    if (document.exitFullscreen) document.exitFullscreen();
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+  } else {
+    if (videoWrap.requestFullscreen) videoWrap.requestFullscreen();
+    else if (videoWrap.webkitRequestFullscreen) videoWrap.webkitRequestFullscreen();
+    else if (videoWrap.mozRequestFullScreen) videoWrap.mozRequestFullScreen();
+    else if (videoWrap.msRequestFullscreen) videoWrap.msRequestFullscreen();
+  }
+}
+
+function updateFullscreenUI() {
+  const fs = isFullscreen();
+  fullscreenBtn.textContent = fs ? '⛶ 退出' : '⛶';
+  fullscreenBtn.title = fs ? '退出全屏' : '全屏播放';
+  fsPlayToggle.style.display = fs ? 'block' : 'none';
+  fsExitToggle.style.display = fs ? 'block' : 'none';
+  if (fs) syncPlayToggleIcon();
+}
+
+fullscreenBtn.onclick = toggleFullscreen;
+
+// 全屏容器内的退出按钮：触屏无键盘也能退出
+fsExitToggle.onclick = () => {
+  if (document.exitFullscreen) document.exitFullscreen();
+  else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+};
+
+// 全屏状态变化（标准 + Safari/旧内核前缀）
+document.addEventListener('fullscreenchange', updateFullscreenUI);
+document.addEventListener('webkitfullscreenchange', updateFullscreenUI);
+document.addEventListener('mozfullscreenchange', updateFullscreenUI);
+document.addEventListener('MSFullscreenChange', updateFullscreenUI);
+
+// 全屏时右下角大播放/暂停按钮：点击切换播放状态
+function syncPlayToggleIcon() {
+  fsPlayToggle.textContent = videoEl.paused ? '▶' : '⏸';
+}
+fsPlayToggle.onclick = () => {
+  if (videoEl.paused) videoEl.play().catch(() => {});
+  else videoEl.pause();
+};
+videoEl.addEventListener('play', syncPlayToggleIcon);
+videoEl.addEventListener('pause', syncPlayToggleIcon);
 
 // 视频播放失败提示（如浏览器不支持的编码格式，可提示下载）
 videoEl.addEventListener('error', () => {
