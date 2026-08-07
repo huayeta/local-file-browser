@@ -371,7 +371,7 @@ function restoreSearchScroll(q) {
 // ============================================================
 async function loadRoots() {
   try {
-    const res = await fetch('/api/roots');
+    const res = await fetch('/local/api/roots');
     const data = await res.json();
     roots = data.roots || [];
     const bar = $('roots-bar');
@@ -471,7 +471,7 @@ async function loadList() {
   breadcrumbEl.innerHTML = '';
   try {
     const qs = new URLSearchParams({ root: currentRoot, path: currentPath });
-    const res = await fetch('/api/list?' + qs.toString());
+    const res = await fetch('/local/api/list?' + qs.toString());
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || ('HTTP ' + res.status));
@@ -574,7 +574,7 @@ function escapeHtml(s) {
 // ============================================================
 function fileUrl(e) {
   const qs = new URLSearchParams({ root: currentRoot, path: e.path });
-  return '/file?' + qs.toString();
+  return '/local/file?' + qs.toString();
 }
 
 function handleClick(e) {
@@ -740,7 +740,7 @@ async function doSearch(q) {
   breadcrumbEl.innerHTML = '';
   try {
     const qs = new URLSearchParams({ root: currentRoot, q });
-    const res = await fetch('/api/search?' + qs.toString(), { signal: controller.signal });
+    const res = await fetch('/local/api/search?' + qs.toString(), { signal: controller.signal });
     if (seq !== searchSeq) return;  // 已有更新的请求，丢弃本次结果
     const data = await res.json();
     if (seq !== searchSeq) return;

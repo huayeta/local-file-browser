@@ -589,7 +589,15 @@ function pipeFile(res, full, opts) {
 // ============================================================
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const p = url.pathname;
+  let p = url.pathname;
+
+  // 支持 /local 前缀（旧路径 /api/xxx、/file、/ 仍兼容）：
+  //   /local        → 页面
+  //   /local/api/xxx → API
+  //   /local/file   → 文件服务
+  if (p === '/local' || p.startsWith('/local/')) {
+    p = p.slice(6) || '/';
+  }
 
   // 请求日志（可配置：config.json 的 logRequests，默认开启）
   // 响应完成后打印：时间 方法 URL -> 状态码 (耗时)
