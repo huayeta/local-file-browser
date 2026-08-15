@@ -220,11 +220,12 @@
   }
   #pdf-close:hover { color: #fff; border-color: var(--accent); }
   #pdf-body {
-    flex: 1; overflow: auto; display: flex; justify-content: center; align-items: flex-start;
+    flex: 1; overflow: auto; display: flex; justify-content: flex-start; align-items: flex-start;
     background: #0a0e18; border: 1px solid var(--border); border-radius: 8px; padding: 12px;
     position: relative;  /* 供 loading 浮层绝对定位 */
   }
-  #pdf-canvas { max-width: 100%; box-shadow: 0 2px 12px rgba(0,0,0,.5); background: #fff; }
+  /* margin auto：canvas 小于容器时居中；放大溢出时自动左对齐，滚动条可达左侧 */
+  #pdf-canvas { margin: 0 auto; box-shadow: 0 2px 12px rgba(0,0,0,.5); background: #fff; }
   /* 加载浮层：覆盖在 canvas 上方居中，翻页时旧页保留可见（不白板） */
   #pdf-loading {
     position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
@@ -242,6 +243,11 @@
   }
   #pdf-controls button:hover:not(:disabled) { border-color: var(--accent); }
   #pdf-controls button:disabled { opacity: .4; cursor: default; }
+  /* 缩放控件组：组内同行排列，换行时整组一起换行 */
+  #pdf-zoom-group {
+    display: flex; align-items: center; gap: 8px;
+    flex-shrink: 0;
+  }
   #pdf-page-info { font-size: 13px; color: var(--muted); min-width: 70px; text-align: center; }
   #pdf-jump {
     width: 70px; padding: 6px 8px; font-size: 13px; text-align: center;
@@ -299,6 +305,13 @@
     #text-overlay { padding: 10px 12px 14px; }
     #text-content { padding: 10px; font-size: 12px; }
     .empty, #loading { padding: 28px; }
+    /* PDF 控制栏窄屏适配：允许换行成两行，确保上一页/下一页可见 */
+    #pdf-controls {
+      flex-wrap: wrap; gap: 8px; justify-content: center;
+    }
+    #pdf-controls button { padding: 6px 12px; font-size: 13px; }
+    #pdf-jump { width: 58px; padding: 6px 6px; font-size: 12px; }
+    .pdf-sep { display: none; }
   }
 </style>
 </head>
@@ -372,10 +385,12 @@
     <input id="pdf-jump" type="number" min="1" step="1" placeholder="跳转页" title="输入页码后回车跳转">
     <button id="pdf-next">下一页 ▶</button>
     <span class="pdf-sep"></span>
-    <button id="pdf-zoom-out" title="缩小">−</button>
-    <button id="pdf-zoom-reset" title="适应宽度">适应</button>
-    <button id="pdf-zoom-in" title="放大">＋</button>
-    <span id="pdf-zoom-info">100%</span>
+    <span id="pdf-zoom-group">
+      <button id="pdf-zoom-out" title="缩小">−</button>
+      <button id="pdf-zoom-reset" title="适应宽度">适应</button>
+      <button id="pdf-zoom-in" title="放大">＋</button>
+      <span id="pdf-zoom-info">100%</span>
+    </span>
   </div>
   <div id="pdf-hint"></div>
 </div>
@@ -1265,10 +1280,16 @@ async function renderPdfPage() {
       scale = Math.min(2.5, Math.max(0.5, containerWidth / base.width));
     }
     const viewport = page.getViewport({ scale });
-    pdfCanvas.width = viewport.width;
-    pdfCanvas.height = viewport.height;
+    // 高 DPI 适配：把 dpr 直接融入 viewport scale（渲染用高分辨率 viewport），
+    // canvas 物理像素即高清分辨率，完全不用 ctx 变换，从根源避免变形
+    const dpr = window.devicePixelRatio || 1;
+    const hdViewport = page.getViewport({ scale: scale * dpr });
+    pdfCanvas.width = Math.floor(hdViewport.width);
+    pdfCanvas.height = Math.floor(hdViewport.height);
+    pdfCanvas.style.width = Math.floor(viewport.width) + 'px';   // 显示尺寸保持逻辑尺寸
+    pdfCanvas.style.height = Math.floor(viewport.height) + 'px';
     const ctx = pdfCanvas.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
+    await page.render({ canvasContext: ctx, viewport: hdViewport }).promise;
     pdfPageInfo.textContent = `${pdfPageNum} / ${pdfDoc.numPages}`;
     $('pdf-prev').disabled = pdfPageNum <= 1;
     $('pdf-next').disabled = pdfPageNum >= pdfDoc.numPages;
