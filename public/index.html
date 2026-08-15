@@ -222,9 +222,16 @@
   #pdf-body {
     flex: 1; overflow: auto; display: flex; justify-content: center; align-items: flex-start;
     background: #0a0e18; border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+    position: relative;  /* 供 loading 浮层绝对定位 */
   }
   #pdf-canvas { max-width: 100%; box-shadow: 0 2px 12px rgba(0,0,0,.5); background: #fff; }
-  #pdf-loading { color: var(--muted); font-size: 14px; padding: 40px; }
+  /* 加载浮层：覆盖在 canvas 上方居中，翻页时旧页保留可见（不白板） */
+  #pdf-loading {
+    position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
+    color: var(--text); font-size: 14px; padding: 14px 22px;
+    background: rgba(20, 28, 48, .92); border: 1px solid var(--border); border-radius: 10px;
+    z-index: 5; display: none;
+  }
   #pdf-controls {
     display: flex; align-items: center; justify-content: center; gap: 16px;
     padding-top: 10px;
@@ -236,6 +243,18 @@
   #pdf-controls button:hover:not(:disabled) { border-color: var(--accent); }
   #pdf-controls button:disabled { opacity: .4; cursor: default; }
   #pdf-page-info { font-size: 13px; color: var(--muted); min-width: 70px; text-align: center; }
+  #pdf-jump {
+    width: 70px; padding: 6px 8px; font-size: 13px; text-align: center;
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; outline: none;
+  }
+  #pdf-jump:focus { border-color: var(--accent); }
+  .pdf-sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+  #pdf-controls button#pdf-zoom-out,
+  #pdf-controls button#pdf-zoom-in {
+    width: 36px; padding: 6px 0; font-size: 16px;
+  }
+  #pdf-zoom-info { font-size: 12px; color: var(--muted); min-width: 44px; text-align: center; }
   #pdf-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
   /* ============================================================
@@ -350,7 +369,13 @@
   <div id="pdf-controls">
     <button id="pdf-prev">◀ 上一页</button>
     <span id="pdf-page-info">- / -</span>
+    <input id="pdf-jump" type="number" min="1" step="1" placeholder="跳转页" title="输入页码后回车跳转">
     <button id="pdf-next">下一页 ▶</button>
+    <span class="pdf-sep"></span>
+    <button id="pdf-zoom-out" title="缩小">−</button>
+    <button id="pdf-zoom-reset" title="适应宽度">适应</button>
+    <button id="pdf-zoom-in" title="放大">＋</button>
+    <span id="pdf-zoom-info">100%</span>
   </div>
   <div id="pdf-hint"></div>
 </div>
@@ -1146,6 +1171,27 @@ let pdfDoc = null;          // 当前 PDF 文档对象
 let pdfPageNum = 1;         // 当前页
 let pdfLoadTask = null;     // 当前加载任务（用于中断）
 let pdfRendering = false;   // 是否正在渲染（防连点）
+let pdfPosId = null;        // 当前 PDF 标识（root:path），用于记忆阅读位置
+let pdfZoom = 0;            // 手动缩放值（0 = 适应宽度）
+
+// 记住每篇 PDF 的阅读位置（localStorage，重开自动定位）
+const PDF_POS_KEY = 'lfb-pdf-pos';
+function savePdfPos() {
+  if (!pdfPosId || !pdfDoc) return;
+  try {
+    const map = JSON.parse(localStorage.getItem(PDF_POS_KEY) || '{}');
+    map[pdfPosId] = pdfPageNum;
+    localStorage.setItem(PDF_POS_KEY, JSON.stringify(map));
+  } catch (e) { /* ignore */ }
+}
+function getPdfPos() {
+  if (!pdfPosId) return 0;
+  try {
+    const map = JSON.parse(localStorage.getItem(PDF_POS_KEY) || '{}');
+    const p = parseInt(map[pdfPosId], 10);
+    return Number.isFinite(p) && p > 0 ? p : 0;
+  } catch (e) { return 0; }
+}
 
 async function openPdfPreview(e) {
   $('pdf-title').textContent = '📄 ' + e.name;
@@ -1177,8 +1223,18 @@ async function openPdfPreview(e) {
       rangeChunkSize: 65536,    // 分片大小 64KB
       isEvalSupported: false,   // 兼容性更稳
     });
+    // 加载进度回调：加载浮层显示整体百分比（按需加载时 total 可能为 0，则只显示"加载中"）
+    pdfLoadTask.onProgress = ({ loaded, total }) => {
+      if (total > 0) {
+        const pct = Math.min(100, Math.round((loaded / total) * 100));
+        pdfLoadingEl.textContent = '📄 加载中... ' + pct + '%';
+      }
+    };
     pdfDoc = await pdfLoadTask.promise;
-    pdfPageNum = 1;
+    pdfPosId = currentRoot + ':' + e.path;  // 记忆该 PDF 的阅读位置
+    // 恢复上次阅读位置（有记录则跳回那一页，否则第 1 页）
+    const saved = getPdfPos();
+    pdfPageNum = (saved >= 1 && saved <= pdfDoc.numPages) ? saved : 1;
     await renderPdfPage();
     pdfLoadingEl.style.display = 'none';
     pdfCanvas.style.display = 'block';
@@ -1191,12 +1247,19 @@ async function openPdfPreview(e) {
 async function renderPdfPage() {
   if (!pdfDoc || pdfRendering) return;
   pdfRendering = true;
+  pdfLoadingEl.textContent = '📄 加载中...';  // 翻页无整体进度，重置为纯加载中
+  pdfLoadingEl.style.display = 'block';  // 翻页/渲染期间显示加载浮层（旧页保留可见）
   try {
     const page = await pdfDoc.getPage(pdfPageNum);
-    // 按容器宽度自适应缩放
+    // 缩放：pdfZoom=0 时适应容器宽度；否则用手动缩放值
     const containerWidth = $('pdf-body').clientWidth - 40;
     const base = page.getViewport({ scale: 1 });
-    const scale = Math.min(2.5, Math.max(0.5, containerWidth / base.width));
+    let scale;
+    if (pdfZoom > 0) {
+      scale = pdfZoom;
+    } else {
+      scale = Math.min(2.5, Math.max(0.5, containerWidth / base.width));
+    }
     const viewport = page.getViewport({ scale });
     pdfCanvas.width = viewport.width;
     pdfCanvas.height = viewport.height;
@@ -1205,8 +1268,20 @@ async function renderPdfPage() {
     pdfPageInfo.textContent = `${pdfPageNum} / ${pdfDoc.numPages}`;
     $('pdf-prev').disabled = pdfPageNum <= 1;
     $('pdf-next').disabled = pdfPageNum >= pdfDoc.numPages;
+    savePdfPos();          // 记住当前阅读位置
+    preloadPdfPages();  // 渲染完成后预加载后 2 页（不阻塞、吞错）
   } finally {
+    pdfLoadingEl.style.display = 'none';  // 渲染完成隐藏浮层
     pdfRendering = false;
+  }
+}
+
+// 预加载后 2 页：仅 getPage 预热缓存（不渲染不显示），翻页时命中缓存秒切
+function preloadPdfPages() {
+  if (!pdfDoc) return;
+  const max = Math.min(pdfPageNum + 2, pdfDoc.numPages);
+  for (let n = pdfPageNum + 1; n <= max; n++) {
+    pdfDoc.getPage(n).catch(() => {});  // 预热失败忽略，不影响当前页
   }
 }
 
@@ -1220,6 +1295,38 @@ function closePdfPreview() {
 $('pdf-close').onclick = closePdfPreview;
 $('pdf-prev').onclick = () => { if (pdfPageNum > 1) { pdfPageNum--; renderPdfPage(); } };
 $('pdf-next').onclick = () => { if (pdfDoc && pdfPageNum < pdfDoc.numPages) { pdfPageNum++; renderPdfPage(); } };
+
+// 缩放控制：放大/缩小/适应宽度（pdfZoom=0 表示适应宽度）
+function updatePdfZoomInfo() {
+  $('pdf-zoom-info').textContent = pdfZoom > 0 ? Math.round(pdfZoom * 100) + '%' : '适应';
+}
+$('pdf-zoom-in').onclick = () => {
+  pdfZoom = Math.min(3, (pdfZoom > 0 ? pdfZoom : 1) + 0.25);
+  updatePdfZoomInfo();
+  renderPdfPage();
+};
+$('pdf-zoom-out').onclick = () => {
+  pdfZoom = Math.max(0.5, (pdfZoom > 0 ? pdfZoom : 1) - 0.25);
+  updatePdfZoomInfo();
+  renderPdfPage();
+};
+$('pdf-zoom-reset').onclick = () => {
+  pdfZoom = 0;  // 适应宽度
+  updatePdfZoomInfo();
+  renderPdfPage();
+};
+
+// 页码输入框：回车跳转（校验 1..numPages 范围）
+$('pdf-jump').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  const n = parseInt($('pdf-jump').value, 10);
+  if (!pdfDoc || isNaN(n)) return;
+  if (n < 1) { pdfPageNum = 1; }
+  else if (n > pdfDoc.numPages) { pdfPageNum = pdfDoc.numPages; }
+  else { pdfPageNum = n; }
+  $('pdf-jump').value = '';
+  renderPdfPage();
+});
 
 // 键盘翻页（浮层打开时）：← → 键
 document.addEventListener('keydown', e => {
