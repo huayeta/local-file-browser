@@ -204,6 +204,40 @@
   }
   #text-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
+  /* PDF 查看浮层（PDF.js 按需加载） */
+  #pdf-overlay {
+    position: fixed; left: 0; right: 0; bottom: 0; top: 0; z-index: 100;
+    background: rgba(10, 14, 24, .97);
+    padding: 12px 16px 16px; display: none; flex-direction: column;
+  }
+  #pdf-overlay.show { display: flex; }
+  #pdf-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  #pdf-title { font-size: 13px; color: var(--text); flex: 1; word-break: break-all; }
+  #pdf-close {
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 3px 10px;
+    cursor: pointer; font-size: 12px;
+  }
+  #pdf-close:hover { color: #fff; border-color: var(--accent); }
+  #pdf-body {
+    flex: 1; overflow: auto; display: flex; justify-content: center; align-items: flex-start;
+    background: #0a0e18; border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+  }
+  #pdf-canvas { max-width: 100%; box-shadow: 0 2px 12px rgba(0,0,0,.5); background: #fff; }
+  #pdf-loading { color: var(--muted); font-size: 14px; padding: 40px; }
+  #pdf-controls {
+    display: flex; align-items: center; justify-content: center; gap: 16px;
+    padding-top: 10px;
+  }
+  #pdf-controls button {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 6px 16px; cursor: pointer; font-size: 13px;
+  }
+  #pdf-controls button:hover:not(:disabled) { border-color: var(--accent); }
+  #pdf-controls button:disabled { opacity: .4; cursor: default; }
+  #pdf-page-info { font-size: 13px; color: var(--muted); min-width: 70px; text-align: center; }
+  #pdf-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
   /* ============================================================
      响应式适配
      · 769–1024px：窄桌面/平板，紧凑布局
@@ -301,6 +335,24 @@
   </div>
   <pre id="text-content">加载中...</pre>
   <div id="text-hint"></div>
+</div>
+
+<!-- PDF 查看浮层（PDF.js 按需加载） -->
+<div id="pdf-overlay">
+  <div id="pdf-head">
+    <span id="pdf-title"></span>
+    <button id="pdf-close">✕ 关闭</button>
+  </div>
+  <div id="pdf-body">
+    <canvas id="pdf-canvas"></canvas>
+    <div id="pdf-loading">📄 加载中...</div>
+  </div>
+  <div id="pdf-controls">
+    <button id="pdf-prev">◀ 上一页</button>
+    <span id="pdf-page-info">- / -</span>
+    <button id="pdf-next">下一页 ▶</button>
+  </div>
+  <div id="pdf-hint"></div>
 </div>
 
 <script>
@@ -643,8 +695,10 @@ function handleClick(e) {
   markVisited(e);  // 记录"已点击过"，列表渲染时以 .visited 淡紫色标识
   if (e.kind === 'video' || e.kind === 'audio') {
     openPlayer(e);
-  } else if (e.kind === 'pdf' || e.kind === 'image') {
-    window.open(fileUrl(e), '_blank'); // 浏览器内置 PDF 阅读器 / 图片查看
+  } else if (e.kind === 'pdf') {
+    openPdfPreview(e);  // PDF.js 浮层按需加载（大文件秒开）
+  } else if (e.kind === 'image') {
+    window.open(fileUrl(e), '_blank'); // 图片新标签页查看
   } else if (e.kind === 'text') {
     openTextPreview(e);
   } else {
@@ -1080,6 +1134,90 @@ function closeTextPreview() {
 }
 
 $('text-close').onclick = closeTextPreview;
+
+// ============================================================
+// PDF 查看（PDF.js 按需加载：打开即显示第一页，翻页才拉取数据）
+// ============================================================
+const pdfOverlay = $('pdf-overlay');
+const pdfCanvas = $('pdf-canvas');
+const pdfLoadingEl = $('pdf-loading');
+const pdfPageInfo = $('pdf-page-info');
+let pdfDoc = null;          // 当前 PDF 文档对象
+let pdfPageNum = 1;         // 当前页
+let pdfLoadTask = null;     // 当前加载任务（用于中断）
+let pdfRendering = false;   // 是否正在渲染（防连点）
+
+async function openPdfPreview(e) {
+  $('pdf-title').textContent = '📄 ' + e.name;
+  $('pdf-hint').textContent = '';
+  pdfLoadingEl.style.display = 'block';
+  pdfCanvas.style.display = 'none';
+  pdfOverlay.classList.add('show');
+
+  try {
+    // 按需动态加载 PDF.js（首次点击时才加载库本身）
+    const pdfjs = await import('/local/pdfjs/pdf.min.mjs');
+    pdfjs.GlobalWorkerOptions.workerSrc = '/local/pdfjs/pdf.worker.min.mjs';
+
+    // 中断上一次加载（快速切换文件时）
+    if (pdfLoadTask) { try { pdfLoadTask.destroy(); } catch (err) {} }
+
+    // 关键：disableAutoFetch + 服务端 Range 206 → 只拉取需要的部分
+    pdfLoadTask = pdfjs.getDocument({
+      url: fileUrl(e),
+      disableAutoFetch: true,   // 不预取整份文档
+      isEvalSupported: false,   // 兼容性更稳
+    });
+    pdfDoc = await pdfLoadTask.promise;
+    pdfPageNum = 1;
+    await renderPdfPage();
+    pdfLoadingEl.style.display = 'none';
+    pdfCanvas.style.display = 'block';
+  } catch (err) {
+    pdfLoadingEl.style.display = 'none';
+    $('pdf-hint').textContent = '❌ PDF 加载失败: ' + (err.message || err);
+  }
+}
+
+async function renderPdfPage() {
+  if (!pdfDoc || pdfRendering) return;
+  pdfRendering = true;
+  try {
+    const page = await pdfDoc.getPage(pdfPageNum);
+    // 按容器宽度自适应缩放
+    const containerWidth = $('pdf-body').clientWidth - 40;
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(2.5, Math.max(0.5, containerWidth / base.width));
+    const viewport = page.getViewport({ scale });
+    pdfCanvas.width = viewport.width;
+    pdfCanvas.height = viewport.height;
+    const ctx = pdfCanvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    pdfPageInfo.textContent = `${pdfPageNum} / ${pdfDoc.numPages}`;
+    $('pdf-prev').disabled = pdfPageNum <= 1;
+    $('pdf-next').disabled = pdfPageNum >= pdfDoc.numPages;
+  } finally {
+    pdfRendering = false;
+  }
+}
+
+function closePdfPreview() {
+  pdfOverlay.classList.remove('show');
+  if (pdfLoadTask) { try { pdfLoadTask.destroy(); } catch (err) {} }
+  pdfDoc = null;
+  pdfLoadTask = null;
+}
+
+$('pdf-close').onclick = closePdfPreview;
+$('pdf-prev').onclick = () => { if (pdfPageNum > 1) { pdfPageNum--; renderPdfPage(); } };
+$('pdf-next').onclick = () => { if (pdfDoc && pdfPageNum < pdfDoc.numPages) { pdfPageNum++; renderPdfPage(); } };
+
+// 键盘翻页（浮层打开时）：← → 键
+document.addEventListener('keydown', e => {
+  if (!pdfOverlay.classList.contains('show')) return;
+  if (e.key === 'ArrowLeft') { if (pdfPageNum > 1) { pdfPageNum--; renderPdfPage(); } }
+  else if (e.key === 'ArrowRight') { if (pdfDoc && pdfPageNum < pdfDoc.numPages) { pdfPageNum++; renderPdfPage(); } }
+});
 
 // 键盘 Esc 关闭浮层（播放器或文本预览）
 document.addEventListener('keydown', e => {

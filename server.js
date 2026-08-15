@@ -585,6 +585,47 @@ function pipeFile(res, full, opts) {
 }
 
 // ============================================================
+// 静态文件：PDF.js 查看器资源（public/pdfjs/，供前端按需加载 PDF）
+// ============================================================
+const PDFJS_DIR = path.join(__dirname, 'public', 'pdfjs');
+const PDFJS_MIME = {
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.wasm': 'application/wasm',
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+function servePdfjs(req, res, p) {
+  // p 形如 /pdfjs/xxx.yyy，剥离前缀并做路径安全校验（防越界）
+  const rel = p.slice('/pdfjs/'.length);
+  const full = path.normalize(path.join(PDFJS_DIR, rel));
+  if (full !== PDFJS_DIR && !full.startsWith(PDFJS_DIR + path.sep)) {
+    res.statusCode = 403;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Forbidden');
+    return;
+  }
+  let buf;
+  try { buf = fs.readFileSync(full); }
+  catch (e) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Not Found');
+    return;
+  }
+  res.statusCode = 200;
+  res.setHeader('Content-Type', PDFJS_MIME[path.extname(full).toLowerCase()] || 'application/octet-stream');
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+}
+
+// ============================================================
 // HTTP 服务
 // ============================================================
 const server = http.createServer((req, res) => {
@@ -641,6 +682,9 @@ const server = http.createServer((req, res) => {
       apiSearch(req, res, url);
     } else if (p === '/file') {
       serveFile(req, res, url);
+    } else if (p.startsWith('/pdfjs/')) {
+      // PDF.js 查看器静态资源（public/pdfjs/）
+      servePdfjs(req, res, p);
     } else {
       res.statusCode = 404;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
