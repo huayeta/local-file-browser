@@ -50,6 +50,8 @@ node server.js
 {
   "port": 3002,
   "cacheTtlSeconds": 60,
+  "logRequests": true,
+  "pdfPreloadPages": 3,
   "roots": [
     { "name": "视频库", "path": "/Users/zhuhui/Movies" },
     { "name": "音乐库", "path": "/Users/zhuhui/Music" },
@@ -66,6 +68,8 @@ node server.js
 |---|---|---|
 | `port` | 服务端口 | 3001 |
 | `cacheTtlSeconds` | 目录列表缓存的兜底过期时间（秒） | 60 |
+| `logRequests` | 是否打印请求日志（时间/方法/URL/状态码/耗时） | true |
+| `pdfPreloadPages` | PDF 预加载页数（滑动窗口，公网慢链路可调大以获得无感翻页） | 3 |
 | `roots` | 根目录数组：`name` 显示名、`path` 本地绝对路径 | 必填 |
 | `shortcuts` | 快捷访问：`root` 根目录索引（对应 roots 顺序）、`path` 该根目录内的相对路径 | 可选 |
 

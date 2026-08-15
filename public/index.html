@@ -499,6 +499,8 @@ async function loadRoots() {
     const res = await fetch('/local/api/roots');
     const data = await res.json();
     roots = data.roots || [];
+    // 读取 PDF 预加载页数配置（热重载后重新拉取生效）
+    if (data.pdfPreloadPages > 0) pdfPreloadPages = data.pdfPreloadPages;
     const bar = $('roots-bar');
     bar.innerHTML = '';
     roots.forEach(r => {
@@ -1173,6 +1175,8 @@ let pdfLoadTask = null;     // 当前加载任务（用于中断）
 let pdfRendering = false;   // 是否正在渲染（防连点）
 let pdfPosId = null;        // 当前 PDF 标识（root:path），用于记忆阅读位置
 let pdfZoom = 0;            // 手动缩放值（0 = 适应宽度）
+let pdfPreloadPages = 3;    // PDF 预加载页数（滑动窗口，从 /api/roots 读取）
+const pdfPreloaded = new Set();  // 已预热页集合，避免重复请求
 
 // 记住每篇 PDF 的阅读位置（localStorage，重开自动定位）
 const PDF_POS_KEY = 'lfb-pdf-pos';
@@ -1269,19 +1273,25 @@ async function renderPdfPage() {
     $('pdf-prev').disabled = pdfPageNum <= 1;
     $('pdf-next').disabled = pdfPageNum >= pdfDoc.numPages;
     savePdfPos();          // 记住当前阅读位置
-    preloadPdfPages();  // 渲染完成后预加载后 2 页（不阻塞、吞错）
   } finally {
     pdfLoadingEl.style.display = 'none';  // 渲染完成隐藏浮层
     pdfRendering = false;
   }
+  // 本页渲染彻底完成后再发起预热（不争抢当前页渲染资源）
+  setTimeout(preloadPdfPages, 0);
 }
 
-// 预加载后 2 页：仅 getPage 预热缓存（不渲染不显示），翻页时命中缓存秒切
+// 预加载后续 N 页（滑动窗口）：getOperatorList 真正拉取渲染指令并缓存，
+// 翻页时 render() 命中缓存、不再发 Range 请求，公网浏览无感
 function preloadPdfPages() {
   if (!pdfDoc) return;
-  const max = Math.min(pdfPageNum + 2, pdfDoc.numPages);
+  const max = Math.min(pdfPageNum + pdfPreloadPages, pdfDoc.numPages);
   for (let n = pdfPageNum + 1; n <= max; n++) {
-    pdfDoc.getPage(n).catch(() => {});  // 预热失败忽略，不影响当前页
+    if (pdfPreloaded.has(n)) continue;  // 已预热过则跳过
+    pdfPreloaded.add(n);
+    pdfDoc.getPage(n)
+      .then(p => p.getOperatorList())   // 真正拉取该页渲染指令并缓存
+      .catch(() => { pdfPreloaded.delete(n); });  // 失败忽略，允许后续重试
   }
 }
 

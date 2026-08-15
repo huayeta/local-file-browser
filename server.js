@@ -220,6 +220,7 @@ function apiRoots(req, res) {
   sendJson(res, 200, {
     roots: CONFIG.roots.map((r, i) => ({ index: i, name: r.name, path: r.path })),
     shortcuts,
+    pdfPreloadPages: CONFIG.pdfPreloadPages || 3,  // PDF 预加载页数（前端滑动窗口用）
   });
 }
 
@@ -505,7 +506,8 @@ function serveFile(req, res, url) {
     const range = req.headers.range;
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Type', mimeOf(name));
-    res.setHeader('Cache-Control', 'no-cache');
+    // no-transform：禁止 Cloudflare/nginx 等代理对该响应压缩（压缩会破坏 Range，导致全量下载）
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     // 打开方式：inline 让浏览器直接播放
     res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(name)}"`);
 

@@ -2,6 +2,7 @@
   "port": 3002,
   "cacheTtlSeconds": 60,
   "logRequests": true,
+  "pdfPreloadPages": 3,
   "roots": [
     {
       "name": "视频库",
