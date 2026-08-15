@@ -1154,6 +1154,12 @@ async function openPdfPreview(e) {
   pdfCanvas.style.display = 'none';
   pdfOverlay.classList.add('show');
 
+  // 重置分页状态：切换文件时不沿用上一个 PDF 的页码
+  pdfPageNum = 1;
+  pdfPageInfo.textContent = '- / -';
+  $('pdf-prev').disabled = true;
+  $('pdf-next').disabled = true;
+
   try {
     // 按需动态加载 PDF.js（首次点击时才加载库本身）
     const pdfjs = await import('/local/pdfjs/pdf.min.mjs');
@@ -1162,10 +1168,13 @@ async function openPdfPreview(e) {
     // 中断上一次加载（快速切换文件时）
     if (pdfLoadTask) { try { pdfLoadTask.destroy(); } catch (err) {} }
 
-    // 关键：disableAutoFetch + 服务端 Range 206 → 只拉取需要的部分
+    // 关键：disableAutoFetch + disableStream + 服务端 Range 206 → 只拉取需要的部分
+    // disableStream 强制 PDF.js 走 Range 分片而非流式全量读取（探测请求会立即取消）
     pdfLoadTask = pdfjs.getDocument({
       url: fileUrl(e),
       disableAutoFetch: true,   // 不预取整份文档
+      disableStream: true,      // 禁用流式读取，强制按需 Range 分片
+      rangeChunkSize: 65536,    // 分片大小 64KB
       isEvalSupported: false,   // 兼容性更稳
     });
     pdfDoc = await pdfLoadTask.promise;
