@@ -625,6 +625,7 @@ const server = http.createServer((req, res) => {
       // 前端页面（内存缓存，启动时已读入）
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');  // 禁止浏览器缓存页面，避免拿到旧版
       res.setHeader('Content-Length', INDEX_HTML.length);
       res.end(INDEX_HTML);
     } else if (p === '/api/roots') {

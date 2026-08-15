@@ -114,6 +114,9 @@
   .item.pdf .name { color: var(--pdf); }
   .item.image .name { color: var(--image); }
   .item.text .name { color: var(--accent); }
+  /* 已访问（点击过）的文件：淡紫色，类似 a:visited 语义（放在类型色之后以覆盖） */
+  .item.visited .name { color: #b39ddb; }
+  .item.visited .icon { opacity: .85; }
   .empty { text-align: center; color: var(--muted); padding: 40px; }
   #loading { text-align: center; color: var(--muted); padding: 40px; }
 
@@ -593,13 +596,18 @@ function renderList() {
   }
   entries.forEach(e => {
     const li = document.createElement('li');
-    li.className = 'item ' + e.kind;
+    // 访问过的文件/目录加 .visited 类（淡紫色标识）
+    li.className = 'item ' + e.kind + (isVisited(e) ? ' visited' : '');
     li.innerHTML = `
       <span class="icon">${ICONS[e.kind] || '📦'}</span>
       <span class="name">${escapeHtml(e.name)}</span>
       <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
     `;
-    li.onclick = () => handleClick(e);
+    li.onclick = () => {
+      handleClick(e);
+      // 立即标记（不等刷新）：文件点击后马上变淡紫色
+      if (!e.isDir) li.classList.add('visited');
+    };
     fileListEl.appendChild(li);
   });
 }
@@ -625,12 +633,14 @@ function fileUrl(e) {
 function handleClick(e) {
   if (e.kind === 'hidden') return;
   if (e.isDir) {
+    markVisited(e);  // 记录"访问过的目录"，返回上级时以 .visited 淡紫色标识
     if (searchMode) { enterDirFromSearch(e); return; }  // 搜索结果里的文件夹：退出搜索并进入
     saveScrollState();  // 记录离开前的滚动位置
     currentPath = e.path;
     loadList();
     return;
   }
+  markVisited(e);  // 记录"已点击过"，列表渲染时以 .visited 淡紫色标识
   if (e.kind === 'video' || e.kind === 'audio') {
     openPlayer(e);
   } else if (e.kind === 'pdf' || e.kind === 'image') {
@@ -646,6 +656,31 @@ function handleClick(e) {
     a.click();
     a.remove();
   }
+}
+
+// ============================================================
+// 已访问标记（localStorage）：记录点击过的文件，列表里以淡紫色显示
+// ============================================================
+const VISITED_KEY = 'lfb-visited';
+const VISITED_MAX = 200;
+
+function getVisited() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(VISITED_KEY) || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+
+function markVisited(e) {
+  const id = currentRoot + ':' + e.path;
+  const arr = getVisited().filter(x => x !== id);
+  arr.unshift(id);
+  if (arr.length > VISITED_MAX) arr.length = VISITED_MAX;
+  try { localStorage.setItem(VISITED_KEY, JSON.stringify(arr)); } catch (err) { /* ignore */ }
+}
+
+function isVisited(e) {
+  return getVisited().includes(currentRoot + ':' + e.path);
 }
 
 // ============================================================
@@ -858,14 +893,19 @@ function renderSearchResults() {
 
   list.forEach(e => {
     const li = document.createElement('li');
-    li.className = 'item ' + e.kind;
+    // 访问过的文件/目录加 .visited 类（淡紫色标识）
+    li.className = 'item ' + e.kind + (isVisited(e) ? ' visited' : '');
     li.innerHTML = `
       <span class="icon">${ICONS[e.kind] || '📦'}</span>
       <span class="name">${highlightMatch(e.name)}</span>
       <span class="search-result-path" title="${escapeHtml(e.isDir ? '' : e.path)}">${escapeHtml(e.isDir ? '' : shortenPath(e.path))}</span>
       <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
     `;
-    li.onclick = () => handleClick(e);
+    li.onclick = () => {
+      handleClick(e);
+      // 立即标记（不等刷新）：文件点击后马上变淡紫色
+      if (!e.isDir) li.classList.add('visited');
+    };
     fileListEl.appendChild(li);
   });
 }
