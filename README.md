@@ -54,6 +54,7 @@ node server.js
   "pdfPreloadPages": 3,
   "searchTimeoutMs": 10000,
   "searchMaxDepth": 8,
+  "searchMaxResults": 200,
   "roots": [
     { "name": "视频库", "path": "/Users/zhuhui/Movies" },
     { "name": "音乐库", "path": "/Users/zhuhui/Music" },
@@ -74,6 +75,7 @@ node server.js
 | `pdfPreloadPages` | PDF 预加载页数（滑动窗口，公网慢链路可调大以获得无感翻页） | 3 |
 | `searchTimeoutMs` | 搜索整体超时（毫秒）。Windows 网络盘/大目录遍历慢时可调大，避免未遍历完即被截断导致搜不到 | 10000 |
 | `searchMaxDepth` | 搜索最大递归深度（层） | 8 |
+| `searchMaxResults` | 搜索返回结果上限（条） | 200 |
 | `roots` | 根目录数组：`name` 显示名、`path` 本地绝对路径 | 必填 |
 | `shortcuts` | 快捷访问：`root` 根目录索引（对应 roots 顺序）、`path` 该根目录内的相对路径 | 可选 |
 

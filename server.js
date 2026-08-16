@@ -326,7 +326,6 @@ function apiList(req, res, url) {
 //   特性：跳过符号链接（防死循环）、多关键词 AND、全角/大小写归一化、
 //         匹配度排序、结果/深度上限、整体超时、客户端取消感知
 // ============================================================
-const SEARCH_MAX_RESULTS = 200;    // 结果上限
 // 整体超时（毫秒）：可从 config.json 的 searchTimeoutMs 配置，
 // Windows 网络盘/大目录可调大，避免遍历未完成即被截断导致搜不到
 const SEARCH_TIMEOUT_MS = CONFIG.searchTimeoutMs || 10000;
@@ -443,9 +442,11 @@ function apiSearch(req, res, url) {
       return a.path.localeCompare(b.path, 'zh-CN');
     });
 
+    // 结果上限动态读取：config.json 的 searchMaxResults 热重载后立即生效
+    const maxResults = CONFIG.searchMaxResults || 200;
     // 遍历已完整执行：仅当超时或结果确实超过上限时才标记截断
-    const truncated = ctx.timedOut || ctx.results.length > SEARCH_MAX_RESULTS;
-    const results = ctx.results.slice(0, SEARCH_MAX_RESULTS).map(({ score, ...rest }) => rest);
+    const truncated = ctx.timedOut || ctx.results.length > maxResults;
+    const results = ctx.results.slice(0, maxResults).map(({ score, ...rest }) => rest);
 
     sendJson(res, 200, {
       query: q,

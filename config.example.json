@@ -5,6 +5,7 @@
   "pdfPreloadPages": 3,
   "searchTimeoutMs": 10000,
   "searchMaxDepth": 8,
+  "searchMaxResults": 200,
   "roots": [
     {
       "name": "视频库",
