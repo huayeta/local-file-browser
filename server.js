@@ -703,9 +703,10 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
   });
 
   proc.on('close', (code) => {
+    // 注意：不能因 job 已被 cancel 删除就 return——取消时已 delete(jobId)，
+    // 若这里跳过，close 里的 .part 清理就不执行（Windows 上残留）
     const cur = transcodeJobs.get(jobId);
-    if (!cur) return;
-    transcodeJobs.delete(jobId);
+    if (cur) transcodeJobs.delete(jobId);
     if (code === 0 && fs.existsSync(dstPart)) {
       // 转码成功：校验产物存在且非空 → rename 为正式 .mp4（原子操作）
       try {
@@ -749,7 +750,8 @@ function apiTranscodeCancel(req, res, url) {
   const dstFull = safeResolve(root.path, rel);
   if (!dstFull) return sendJson(res, 400, { error: '无效路径' });
 
-  // 按目标绝对路径取消：找到对应 job → kill ffmpeg 进程 + 清理 .part
+  // 按目标绝对路径取消：找到对应 job → kill ffmpeg 进程（.part 由 close 回调统一清理——
+  // Windows 上进程未退出时立即 unlink 会因文件被占用而失败，故不在此删除）
   let cancelled = false;
   for (const [jobId, job] of transcodeJobs) {
     if (job.dstFull === dstFull || job.dstFull === dstFull + '.part') {
@@ -758,8 +760,10 @@ function apiTranscodeCancel(req, res, url) {
       cancelled = true;
     }
   }
-  // 兜底清理可能残留的 .part（即使 job 已结束）
-  try { if (fs.existsSync(dstFull + '.part')) fs.unlinkSync(dstFull + '.part'); } catch (e) {}
+  // 兜底：若进程已退出（无 job）但 .part 残留，直接清理
+  if (!cancelled) {
+    try { if (fs.existsSync(dstFull + '.part')) fs.unlinkSync(dstFull + '.part'); } catch (e) {}
+  }
   sendJson(res, 200, { ok: true, cancelled });
 }
 
