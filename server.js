@@ -326,9 +326,10 @@ function apiList(req, res, url) {
 //   特性：跳过符号链接（防死循环）、多关键词 AND、全角/大小写归一化、
 //         匹配度排序、结果/深度上限、整体超时、客户端取消感知
 // ============================================================
-const SEARCH_MAX_DEPTH = 8;        // 最大递归深度
 const SEARCH_MAX_RESULTS = 200;    // 结果上限
-const SEARCH_TIMEOUT_MS = 3000;    // 整体超时（毫秒）
+// 整体超时（毫秒）：可从 config.json 的 searchTimeoutMs 配置，
+// Windows 网络盘/大目录可调大，避免遍历未完成即被截断导致搜不到
+const SEARCH_TIMEOUT_MS = CONFIG.searchTimeoutMs || 10000;
 
 // 归一化：转小写 + 全角→半角 + 全角空格→半角
 function normalizeText(s) {
@@ -355,7 +356,8 @@ async function searchWalk(ctx, absDir, relDir, depth) {
   // 遍历只受取消/超时/深度限制，不因结果数量提前终止——
   // 否则结果多的目录会截断遍历，导致其后目录里的文件/文件夹搜不到
   if (ctx.cancelled || ctx.timedOut) return;
-  if (depth > SEARCH_MAX_DEPTH) return;
+  // 深度上限动态读取：config.json 的 searchMaxDepth 热重载后立即生效
+  if (depth > (CONFIG.searchMaxDepth || 8)) return;
 
   let dirents;
   try {
@@ -425,7 +427,9 @@ function apiSearch(req, res, url) {
     results: [],
   };
 
-  const timer = setTimeout(() => { ctx.timedOut = true; }, SEARCH_TIMEOUT_MS);
+  // 超时动态读取：config.json 的 searchTimeoutMs 热重载后立即生效（不固化在模块顶层）
+  const timeoutMs = CONFIG.searchTimeoutMs || 10000;
+  const timer = setTimeout(() => { ctx.timedOut = true; }, timeoutMs);
 
   (async () => {
     await searchWalk(ctx, ctx.rootFull, '', 0);

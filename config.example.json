@@ -3,6 +3,8 @@
   "cacheTtlSeconds": 60,
   "logRequests": true,
   "pdfPreloadPages": 3,
+  "searchTimeoutMs": 10000,
+  "searchMaxDepth": 8,
   "roots": [
     {
       "name": "视频库",
