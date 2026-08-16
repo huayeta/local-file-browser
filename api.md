@@ -24,6 +24,9 @@
 | `GET /api/list` | 列目录 |
 | `GET /api/search` | 递归搜索 |
 | `GET /file` | 文件服务（播放/查看/下载） |
+| `GET /api/transcode` | 启动视频转码（ffmpeg，不支持编码转 MP4） |
+| `GET /api/transcode-cancel` | 取消转码（kill ffmpeg 进程 + 清理 .part） |
+| `GET /api/transcode-status` | 查询转码状态（none/transcoding/done） |
 | `GET /pdfjs/*` | PDF.js 查看器静态资源 |
 
 ---
@@ -214,6 +217,82 @@ PDF.js 查看器静态资源（`public/pdfjs/` 目录，如 `pdf.min.mjs`、`pdf
 **响应**：`200 OK` + 对应 `Content-Type`（如 `text/javascript; charset=utf-8`）
 
 **错误**：`403`（越界）、`404`（文件不存在）
+
+---
+
+## 8. `GET /api/transcode?root=<i>&path=<rel>`
+
+启动视频转码：浏览器无法直接播放的视频（如 VP6 编码的 .flv）用 ffmpeg 转成 H.264 MP4。**转码产物与源文件同目录并存（不删除源文件）**，先写 `.part` 临时文件，转码成功校验后 rename 为 `.mp4`（原子操作）。
+
+**参数**：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `root` | 否 | 根目录索引，默认 `0` |
+| `path` | 是 | 视频文件相对路径（如 `/视频.flv`） |
+
+**响应**：`200 OK`
+
+```json
+{ "ok": true, "message": "转码已启动，完成前请勿重复操作", "dst": "/Users/.../视频.mp4" }
+```
+
+**说明**：
+- 依赖 ffmpeg/ffprobe（config.json 的 `ffmpegPath`/`ffprobePath`，Windows 需填完整路径）
+- 若同目录已存在转好的 `.mp4` 则直接复用，不重复转码
+- 转码期间可调用 `/api/transcode-cancel` 取消（kill ffmpeg + 清理 .part，源文件始终保留）
+- 崩溃/中断只会残留 `.part`，源文件不受影响，下次转码自动清理
+
+**错误**：`400`（无效 root/不是文件）、`403`（路径越界）、`404`（文件不存在）
+
+---
+
+## 9. `GET /api/transcode-cancel?root=<i>&path=<rel>`
+
+取消正在进行的转码：kill 对应的 ffmpeg 进程 + 清理残留 `.part` 文件，源文件不受影响。
+
+**参数**：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `root` | 否 | 根目录索引，默认 `0` |
+| `path` | 是 | 转码目标路径（同目录 `.mp4` 相对路径，如 `/视频.mp4`） |
+
+**响应**：`200 OK`
+
+```json
+{ "ok": true, "cancelled": true }
+```
+
+**说明**：`cancelled` 为 `true` 表示找到并终止了对应转码任务；为 `false` 表示无进行中的任务（仍会兜底清理 .part）。
+
+**错误**：`400`（无效 root/路径越界）
+
+---
+
+## 10. `GET /api/transcode-status?root=<i>&path=<rel>`
+
+查询转码状态。
+
+**参数**：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `root` | 否 | 根目录索引，默认 `0` |
+| `path` | 是 | 转码目标路径（同目录 `.mp4` 相对路径） |
+
+**响应**：`200 OK`
+
+```json
+{ "status": "transcoding", "exists": false, "progress": 45 }
+```
+
+**说明**：
+- `status` 取值——`none`（无转码产物/未在转码）、`transcoding`（正在转码）、`done`（已有转码产物 `.mp4`）
+- `exists` 与 `status === 'done'` 等价
+- `progress` 转码进度百分比（0-100）：`transcoding` 时返回当前进度（实时递增），`done` 返回 `100`，`none` 返回 `0`
+
+**错误**：`400`（无效 root/路径越界）
 
 ---
 

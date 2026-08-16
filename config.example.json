@@ -6,6 +6,8 @@
   "searchTimeoutMs": 10000,
   "searchMaxDepth": 8,
   "searchMaxResults": 200,
+  "ffmpegPath": "ffmpeg",
+  "ffprobePath": "ffprobe",
   "roots": [
     {
       "name": "视频库",

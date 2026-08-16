@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { URL } = require('url');
+const { execFile, spawn } = require('child_process');
 
 // ============================================================
 // 配置加载
@@ -53,6 +54,8 @@ const STAT_CACHE_MAX = 5000;
 const statCache = new Map();    // key: 绝对路径 → { size, isDir, cachedAt }
 
 const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
+// 页面 ETag：内容 hash，配合 304 协商缓存——浏览器每次都验证，改动后立即拿到新版，未改动则 304 不传 body
+const INDEX_ETAG = '"' + require('crypto').createHash('md5').update(INDEX_HTML).digest('hex') + '"';
 
 // 带缓存的文件 stat（供 /file 使用）
 function statCached(full) {
@@ -105,7 +108,7 @@ fs.watch(CONFIG_PATH, scheduleReload);
 // ============================================================
 // 文件类型判定
 // ============================================================
-const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv', '.mkv', '.avi']);
+const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv', '.mkv', '.avi', '.flv']);
 const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.opus']);
 const PDF_EXTS = new Set(['.pdf']);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico']);
@@ -135,6 +138,7 @@ const MIME = {
   '.ogv': 'video/ogg',
   '.mkv': 'video/x-matroska',
   '.avi': 'video/x-msvideo',
+  '.flv': 'video/x-flv',
   '.mp3': 'audio/mpeg',
   '.wav': 'audio/wav',
   '.ogg': 'audio/ogg',
@@ -592,6 +596,176 @@ function pipeFile(res, full, opts) {
 }
 
 // ============================================================
+// 视频转码（ffmpeg）：浏览器/flv.js 不支持编码（如 VP6）时，
+// 用户确认后在源文件同目录转出 .mp4（与源文件并存，不删除源文件）
+// ============================================================
+const FFMPEG_PATH = CONFIG.ffmpegPath || 'ffmpeg';
+const FFPROBE_PATH = CONFIG.ffprobePath || 'ffprobe';
+// 浏览器原生支持的视频编码（无需转码）
+const SUPPORTED_VIDEO_CODECS = new Set(['h264', 'avc1', 'hevc', 'h265', 'vp8', 'vp9', 'av1']);
+const transcodeJobs = new Map();  // jobId → { proc, rootIndex, rel, srcFull, dstFull, dstPart, startAt }
+
+// ffprobe 读取视频编码（promise 化）
+function probeVideoCodec(full) {
+  return new Promise((resolve) => {
+    execFile(FFPROBE_PATH,
+      ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', full],
+      (err, stdout) => {
+        if (err) return resolve(null);
+        resolve(String(stdout).trim().toLowerCase() || null);
+      });
+  });
+}
+
+// ffprobe 读取视频总时长（秒，promise 化）——转码进度计算用
+function probeVideoDuration(full) {
+  return new Promise((resolve) => {
+    execFile(FFPROBE_PATH,
+      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', full],
+      (err, stdout) => {
+        if (err) return resolve(0);
+        const d = parseFloat(String(stdout).trim());
+        resolve(Number.isFinite(d) && d > 0 ? d : 0);
+      });
+  });
+}
+
+// 判断视频是否需转码：ffprobe 编码不在支持集合内 → 需要
+async function videoNeedsTranscode(full) {
+  const codec = await probeVideoCodec(full);
+  if (!codec) return true; // 无法探测时保守按需转码
+  return !SUPPORTED_VIDEO_CODECS.has(codec);
+}
+
+// 启动转码任务：srcFull → 同目录 src.mp4（先写 .part，成功后 rename）
+async function startTranscodeJob(rootIndex, rel, srcFull) {
+  // 若同目录已有转好的 .mp4（非 .part），直接复用，不重复转
+  const dstFull = srcFull.replace(/\.([^.]+)$/, '.mp4');
+  const dstPart = dstFull + '.part';
+  if (fs.existsSync(dstFull)) {
+    return { jobId: null, done: true, dstFull, message: '已存在转码产物' };
+  }
+
+  const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  // 清理可能残留的 .part（崩溃恢复）
+  try { if (fs.existsSync(dstPart)) fs.unlinkSync(dstPart); } catch (e) {}
+
+  // 先同步注册 job（await 之前的代码同步执行）——apiTranscode 未 await 也能立即查到 transcoding，
+  // 避免前端轮询时 job 未注册而误报"转码失败"
+  const job = { proc: null, rootIndex, rel, srcFull, dstFull, dstPart, startAt: Date.now(), duration: 0, progress: 0 };
+  transcodeJobs.set(jobId, job);
+
+  // 异步读取源视频总时长（秒），用于计算转码进度百分比
+  job.duration = await probeVideoDuration(srcFull);
+
+  const proc = spawn(FFMPEG_PATH, [
+    '-y', '-i', srcFull,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+    '-c:a', 'aac', '-b:a', '128k',
+    '-movflags', '+faststart',
+    '-f', 'mp4',   // 强制输出格式：.part 扩展名无法推断容器格式，不加会转码失败
+    '-progress', 'pipe:1',   // 输出进度到 stdout（out_time_ms= 等键值对）
+    '-nostats',
+    dstPart,
+  ]);
+  job.proc = proc;
+
+  // 解析 ffmpeg stdout 进度（-progress pipe:1 输出 out_time_ms=xxx）
+  let outBuf = '';
+  proc.stdout.on('data', (chunk) => {
+    outBuf += chunk.toString();
+    const lines = outBuf.split('\n');
+    outBuf = lines.pop() || '';
+    for (const line of lines) {
+      const m = /^out_time_ms=(\d+)/.exec(line.trim());
+      if (m && job.duration > 0) {
+        const sec = parseInt(m[1], 10) / 1e6;
+        job.progress = Math.min(99, Math.round((sec / job.duration) * 100));
+      }
+    }
+  });
+
+  proc.on('close', (code) => {
+    const cur = transcodeJobs.get(jobId);
+    if (!cur) return;
+    transcodeJobs.delete(jobId);
+    if (code === 0 && fs.existsSync(dstPart)) {
+      // 转码成功：校验产物存在且非空 → rename 为正式 .mp4（原子操作）
+      try {
+        const st = fs.statSync(dstPart);
+        if (st.size > 0) { fs.renameSync(dstPart, dstFull); }
+        else { fs.unlinkSync(dstPart); }
+      } catch (e) { try { fs.unlinkSync(dstPart); } catch (e2) {} }
+    } else {
+      // 失败/取消：删除 .part，源文件始终保留
+      try { if (fs.existsSync(dstPart)) fs.unlinkSync(dstPart); } catch (e) {}
+    }
+  });
+
+  return { jobId, done: false, dstFull, message: '转码中' };
+}
+
+// API: /api/transcode?root=<i>&path=<rel> — 用户确认后启动转码
+function apiTranscode(req, res, url) {
+  const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
+  const root = CONFIG.roots[rootIndex];
+  if (!root) return sendJson(res, 400, { error: `无效的 root 索引: ${rootIndex}` });
+  const rel = url.searchParams.get('path') || '';
+  const resolved = resolveWithinRoot(root, rel);
+  if (!resolved.ok) return sendJson(res, resolved.status, { error: resolved.error });
+  const full = resolved.full;
+  let stat;
+  try { stat = fs.statSync(full); } catch (e) { return sendJson(res, 404, { error: '文件不存在' }); }
+  if (stat.isDirectory()) return sendJson(res, 400, { error: '这是文件夹，不能转码' });
+
+  startTranscodeJob(rootIndex, rel, full);
+  sendJson(res, 200, { ok: true, message: '转码已启动，完成前请勿重复操作', dst: full.replace(/\.([^.]+)$/, '.mp4') });
+}
+
+// API: /api/transcode-cancel?root=<i>&path=<rel> — 取消转码（kill ffmpeg + 清理 .part）
+function apiTranscodeCancel(req, res, url) {
+  const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
+  const root = CONFIG.roots[rootIndex];
+  if (!root) return sendJson(res, 400, { error: `无效的 root 索引: ${rootIndex}` });
+  const rel = url.searchParams.get('path') || '';
+  // 用 safeResolve（纯路径校验，不要求文件存在——转码产物可能尚未生成）
+  const dstFull = safeResolve(root.path, rel);
+  if (!dstFull) return sendJson(res, 400, { error: '无效路径' });
+
+  // 按目标绝对路径取消：找到对应 job → kill ffmpeg 进程 + 清理 .part
+  let cancelled = false;
+  for (const [jobId, job] of transcodeJobs) {
+    if (job.dstFull === dstFull || job.dstFull === dstFull + '.part') {
+      try { job.proc.kill(); } catch (e) {}
+      transcodeJobs.delete(jobId);
+      cancelled = true;
+    }
+  }
+  // 兜底清理可能残留的 .part（即使 job 已结束）
+  try { if (fs.existsSync(dstFull + '.part')) fs.unlinkSync(dstFull + '.part'); } catch (e) {}
+  sendJson(res, 200, { ok: true, cancelled });
+}
+
+// API: /api/transcode-status?root=<i>&path=<rel> — 查询转码状态（none/transcoding/done + 进度）
+function apiTranscodeStatus(req, res, url) {
+  const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
+  const root = CONFIG.roots[rootIndex];
+  if (!root) return sendJson(res, 400, { error: `无效的 root 索引: ${rootIndex}` });
+  const rel = url.searchParams.get('path') || '';
+  // 用 safeResolve（纯路径校验，不要求文件存在）
+  const dstFull = safeResolve(root.path, rel);
+  if (!dstFull) return sendJson(res, 400, { error: '无效路径' });
+
+  let status = 'none';       // none | transcoding | done
+  let progress = 0;          // 转码进度百分比（0-100）
+  for (const job of transcodeJobs.values()) {
+    if (job.dstFull === dstFull) { status = 'transcoding'; progress = job.progress || 0; break; }
+  }
+  if (status === 'none' && fs.existsSync(dstFull)) { status = 'done'; progress = 100; }
+  sendJson(res, 200, { status, exists: status === 'done', progress });
+}
+
+// ============================================================
 // 静态文件：PDF.js 查看器资源（public/pdfjs/，供前端按需加载 PDF）
 // ============================================================
 const PDFJS_DIR = path.join(__dirname, 'public', 'pdfjs');
@@ -628,6 +802,39 @@ function servePdfjs(req, res, p) {
   }
   res.statusCode = 200;
   res.setHeader('Content-Type', PDFJS_MIME[path.extname(full).toLowerCase()] || 'application/octet-stream');
+  res.setHeader('Content-Length', buf.length);
+  res.end(buf);
+}
+
+// ============================================================
+// 静态文件：flv.js 播放器资源（public/flvjs/，供前端播放 .flv 视频）
+// ============================================================
+const FLVJS_DIR = path.join(__dirname, 'public', 'flvjs');
+const FLVJS_MIME = {
+  '.js': 'text/javascript; charset=utf-8',
+  '.map': 'application/json',
+};
+
+function serveFlvjs(req, res, p) {
+  // p 形如 /flvjs/xxx.yyy，剥离前缀并做路径安全校验（防越界）
+  const rel = p.slice('/flvjs/'.length);
+  const full = path.normalize(path.join(FLVJS_DIR, rel));
+  if (full !== FLVJS_DIR && !full.startsWith(FLVJS_DIR + path.sep)) {
+    res.statusCode = 403;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Forbidden');
+    return;
+  }
+  let buf;
+  try { buf = fs.readFileSync(full); }
+  catch (e) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Not Found');
+    return;
+  }
+  res.statusCode = 200;
+  res.setHeader('Content-Type', FLVJS_MIME[path.extname(full).toLowerCase()] || 'application/octet-stream');
   res.setHeader('Content-Length', buf.length);
   res.end(buf);
 }
@@ -671,6 +878,14 @@ const server = http.createServer((req, res) => {
   try {
     if (p === '/' || p === '/index.html') {
       // 前端页面（内存缓存，启动时已读入）
+      // 协商缓存：no-cache 让浏览器每次请求验证；ETag 未变则 304 不传 body（省流量又不缓存旧版）
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('ETag', INDEX_ETAG);
+      if (req.headers['if-none-match'] === INDEX_ETAG) {
+        res.statusCode = 304;
+        res.end();
+        return;
+      }
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('Content-Length', INDEX_HTML.length);
@@ -688,9 +903,18 @@ const server = http.createServer((req, res) => {
       apiSearch(req, res, url);
     } else if (p === '/file') {
       serveFile(req, res, url);
+    } else if (p === '/api/transcode') {
+      apiTranscode(req, res, url);
+    } else if (p === '/api/transcode-cancel') {
+      apiTranscodeCancel(req, res, url);
+    } else if (p === '/api/transcode-status') {
+      apiTranscodeStatus(req, res, url);
     } else if (p.startsWith('/pdfjs/')) {
       // PDF.js 查看器静态资源（public/pdfjs/）
       servePdfjs(req, res, p);
+    } else if (p.startsWith('/flvjs/')) {
+      // flv.js 播放器静态资源（public/flvjs/）
+      serveFlvjs(req, res, p);
     } else {
       res.statusCode = 404;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');

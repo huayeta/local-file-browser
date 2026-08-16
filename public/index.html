@@ -357,6 +357,7 @@
   </div>
   <audio id="player-audio" controls preload="auto" style="display:none"></audio>
   <div id="player-hint"></div>
+  <button id="transcode-cancel-btn" style="display:none">✕ 取消转码</button>
 </div>
 
 <!-- 文本预览浮层 -->
@@ -1034,20 +1035,197 @@ function enterDirFromSearch(e) {
 const overlay = $('player-overlay');
 const videoEl = $('player-video');
 const audioEl = $('player-audio');
+let flvPlayer = null;  // flv.js 播放实例（.flv 视频用，关闭时需销毁）
+let currentIsFlv = false;  // 当前播放的是否 .flv（用于给出更明确的错误提示）
 
-function openPlayer(e) {
+// 动态加载 flv.js（浏览器原生不支持 FLV，需 flv.js 转封装播放）
+function loadFlvjs() {
+  return new Promise((resolve, reject) => {
+    if (window.flvjs) return resolve(window.flvjs);
+    const s = document.createElement('script');
+    s.src = '/local/flvjs/flv.min.js';
+    s.onload = () => resolve(window.flvjs);
+    s.onerror = () => reject(new Error('flv.js 加载失败'));
+    document.head.appendChild(s);
+  });
+}
+
+function destroyFlvPlayer() {
+  if (flvPlayer) {
+    try { flvPlayer.pause(); flvPlayer.unload(); flvPlayer.detachMediaElement(); flvPlayer.destroy(); } catch (e) {}
+    flvPlayer = null;
+  }
+}
+
+// ============================================================
+// 视频转码（服务端 ffmpeg）：不支持编码的视频 → 用户确认转码为 MP4
+//   产物与源文件同目录并存（不删源文件），完成后刷新列表并自动播放
+// ============================================================
+let transcodeTimer = null;
+let transcodeCancelled = false;  // 用户点击取消转码时置位
+let transcodeCurrentRel = null;  // 当前正在转码的视频相对路径（取消按钮用，避免误用 currentPath）
+let flvFailTarget = null;        // 当前尝试播放的 flv 文件（播放失败 error 回调里弹转码用）
+
+// 同目录转码产物的相对路径（如 /a.flv → /a.mp4）
+function transcodeDstPath(relPath) {
+  return relPath.replace(/\.[^.]+$/, '.mp4');
+}
+
+// 查询转码状态：返回 { status: none|transcoding|done, progress: 0-100 }
+async function checkTranscodeStatus(rootIdx, dstPath) {
+  try {
+    const qs = new URLSearchParams({ root: rootIdx, path: dstPath });
+    const res = await fetch('/local/api/transcode-status?' + qs.toString());
+    const data = await res.json();
+    return { status: data.status || 'none', progress: data.progress || 0 };
+  } catch (e) { return { status: 'none', progress: 0 }; }
+}
+
+// 启动转码并轮询，完成后返回 true；被取消/失败返回 false
+function startTranscode(rootIdx, relPath, onProgress) {
+  return new Promise((resolve) => {
+    const qs = new URLSearchParams({ root: rootIdx, path: relPath });
+    fetch('/local/api/transcode?' + qs.toString())
+      .then(r => r.json())
+      .then(() => {
+        const dstPath = transcodeDstPath(relPath);
+        const poll = async () => {
+          if (transcodeCancelled) { resolve(false); return; }  // 用户已取消
+          const st = await checkTranscodeStatus(rootIdx, dstPath);
+          if (st.status === 'done') { resolve(true); return; }
+          if (st.status === 'none') { resolve(false); return; } // 转码失败或已取消
+          if (onProgress) onProgress('转码中… ' + st.progress + '%');
+          transcodeTimer = setTimeout(poll, 1500);
+        };
+        poll();
+      })
+      .catch(() => resolve(false));
+  });
+}
+
+// 取消转码（kill 后台 ffmpeg + 清理 .part），返回是否成功取消（true/false）
+async function cancelTranscode(rootIdx, relPath) {
+  try {
+    const qs = new URLSearchParams({ root: rootIdx, path: transcodeDstPath(relPath) });
+    const res = await fetch('/local/api/transcode-cancel?' + qs.toString());
+    const data = await res.json();
+    return !!data.cancelled;
+  } catch (e) { return false; }
+}
+
+// .flv 播放入口：优先播放已有转码产物(.mp4)；否则先尝试 flv.js 直接播放，
+// 只有播放失败（多为 VP6 等旧编码）时才提示转码
+async function playFlvWithTranscode(e) {
+  const rootIdx = currentRoot;
+  const dstPath = transcodeDstPath(e.path);
+  const st = await checkTranscodeStatus(rootIdx, dstPath);
+  if (st.status === 'done') {
+    // 已有转码产物 → 直接播放 MP4（H.264，原生 video 即可，支持拖拽）
+    currentIsFlv = false;
+    videoEl.src = '/local/file?' + new URLSearchParams({ root: rootIdx, path: dstPath }).toString();
+    videoEl.play().catch(() => {});
+    return;
+  }
+
+  // 无转码产物 → 先尝试 flv.js 播放（H.264 编码的 FLV 可直接播，不打扰用户）
+  flvFailTarget = e;  // 记录文件，若播放失败(error)回调里用它弹转码
+  try {
+    const flvjs = await loadFlvjs();
+    if (!flvjs.isSupported()) {
+      promptTranscode(e);  // flv.js 不可用 → 直接提示转码
+      return;
+    }
+    flvPlayer = flvjs.createPlayer({ type: 'flv', url: fileUrl(e), isLive: false });
+    flvPlayer.attachMediaElement(videoEl);
+    flvPlayer.load();
+    flvPlayer.play().catch(() => {});
+    // 若该 FLV 编码 flv.js 也不支持（如 VP6），videoEl 会触发 error → 回调里弹转码
+  } catch (err) {
+    promptTranscode(e);
+  }
+}
+
+// 弹"是否转码"确认；用户确认后启动转码并轮询（失败/取消均有明确提示）
+async function promptTranscode(e) {
+  if (!confirm('该视频编码浏览器无法直接播放，是否转码为 MP4？（转码产物与原文件并存，不删除源文件）')) {
+    $('player-hint').textContent = '未转码。如仍需播放，可再次点击该文件并选择转码。';
+    return;
+  }
+  const rootIdx = currentRoot;
+  const dstPath = transcodeDstPath(e.path);
+  // 启动转码并轮询，显示取消按钮（可中途取消，后台同步 kill ffmpeg）
+  transcodeCancelled = false;
+  transcodeCurrentRel = e.path;  // 记录视频文件路径（取消按钮用它，而非 currentPath）
+  $('transcode-cancel-btn').style.display = 'inline-block';
+  $('player-hint').textContent = '⏳ 正在转码为 MP4…（可点击取消）';
+  const ok = await startTranscode(rootIdx, e.path, msg => { $('player-hint').textContent = '⏳ ' + msg; });
+  $('transcode-cancel-btn').style.display = 'none';
+  if (ok) {
+    $('player-hint').textContent = '✅ 转码完成，正在播放…';
+    // 按当前视图刷新：搜索模式下重搜（保持搜索页，新 .mp4 也出现在结果中）；目录模式下重载列表
+    const q = (searchInput.value || '').trim();
+    if (searchMode && q) {
+      doSearch(q);
+    } else {
+      await loadList();  // 刷新列表（新 .mp4 出现，源 .flv 保留）
+    }
+    currentIsFlv = false;
+    videoEl.src = '/local/file?' + new URLSearchParams({ root: rootIdx, path: dstPath }).toString();
+    videoEl.play().catch(() => {});
+  } else if (transcodeCancelled) {
+    $('player-hint').textContent = '已取消转码，源文件未受影响。';
+  } else {
+    $('player-hint').textContent = '❌ 转码失败，源文件未受影响。';
+  }
+}
+
+// 取消转码按钮：点击 → 通知后台 kill ffmpeg + 清理 .part，并停止前端轮询
+$('transcode-cancel-btn').onclick = async () => {
+  transcodeCancelled = true;
+  if (transcodeTimer) { clearTimeout(transcodeTimer); transcodeTimer = null; }
+  $('transcode-cancel-btn').style.display = 'none';
+  $('player-hint').textContent = '正在取消转码…';
+  // 必须用正在转码的视频路径（transcodeCurrentRel），currentPath 是目录路径不匹配
+  const cancelled = await cancelTranscode(currentRoot, transcodeCurrentRel || '');
+  if (cancelled) {
+    $('player-hint').textContent = '已取消转码，源文件未受影响。';
+  } else {
+    // 取消失败：可能是转码已完成（产物已生成）或任务已结束
+    const dstPath = transcodeDstPath(transcodeCurrentRel || '');
+    const st = await checkTranscodeStatus(currentRoot, dstPath);
+    if (st.status === 'done') {
+      $('player-hint').textContent = '转码已完成（无法取消），正在播放转好的 MP4…';
+      // 转码已完成 → 直接播放 MP4（复用 playFlvWithTranscode 的产物播放路径）
+      const { currentRoot: rootIdx } = { currentRoot };
+      videoEl.src = '/local/file?' + new URLSearchParams({ root: rootIdx, path: dstPath }).toString();
+      videoEl.play().catch(() => {});
+    } else {
+      $('player-hint').textContent = '取消失败：未找到正在进行的转码任务，请刷新后重试。';
+    }
+  }
+};
+
+async function openPlayer(e) {
   const url = fileUrl(e);
   $('player-title').textContent = (e.kind === 'video' ? '🎬 ' : '🎵 ') + e.name;
   $('player-hint').textContent = '';
   videoEl.pause(); audioEl.pause();
+  destroyFlvPlayer();
   if (e.kind === 'video') {
     videoEl.style.display = 'block';
     audioEl.style.display = 'none';
-    videoEl.src = url;
-    videoEl.play().catch(() => {});
+    currentIsFlv = /\.flv$/i.test(e.name);
+    // .flv 文件：优先检查转码产物（.mp4），否则提示用户选择是否转码；都不行才用 flv.js
+    if (currentIsFlv) {
+      playFlvWithTranscode(e);
+    } else {
+      videoEl.src = url;
+      videoEl.play().catch(() => {});
+    }
   } else {
     audioEl.style.display = 'block';
     videoEl.style.display = 'none';
+    currentIsFlv = false;
     audioEl.src = url;
     audioEl.play().catch(() => {});
   }
@@ -1056,6 +1234,17 @@ function openPlayer(e) {
 }
 
 function closePlayer() {
+  destroyFlvPlayer();
+  // 转码进行中：关闭弹窗 → 停止前端轮询 + 取消后台转码（kill ffmpeg + 清理 .part）
+  if (transcodeCurrentRel) {
+    transcodeCancelled = true;
+    if (transcodeTimer) { clearTimeout(transcodeTimer); transcodeTimer = null; }
+    cancelTranscode(currentRoot, transcodeCurrentRel);
+    transcodeCurrentRel = null;
+  }
+  // 先清理 FLV 状态再清空 src——否则 src='' 触发 error 事件，误判为播放失败而弹转码确认
+  flvFailTarget = null;
+  currentIsFlv = false;
   videoEl.pause(); videoEl.src = '';
   audioEl.pause(); audioEl.src = '';
   overlay.classList.remove('show');
@@ -1128,8 +1317,19 @@ videoEl.addEventListener('pause', syncPlayToggleIcon);
 
 // 视频播放失败提示（如浏览器不支持的编码格式，可提示下载）
 videoEl.addEventListener('error', () => {
-  const msg = '⚠️ 该视频格式浏览器无法直接播放（编码不支持），可点击列表再次选择或换用支持 MP4/H.264 的文件。';
-  $('player-hint').textContent = msg;
+  // 关闭播放器/清空 src 时也会触发 error 事件（src 已空）——忽略，不弹转码
+  if (!videoEl.currentSrc) return;
+  // .flv 播放失败：先试过 flv.js 仍失败 → 多为旧编码（VP6/Sorenson）→ 弹转码确认
+  if (currentIsFlv) {
+    if (flvFailTarget) {
+      $('player-hint').textContent = '⚠️ 该 FLV 为旧编码（如 VP6，flv.js 仅支持 H.264），无法直接播放。';
+      promptTranscode(flvFailTarget);  // 弹"是否转码"确认
+    } else {
+      $('player-hint').textContent = '⚠️ 该 FLV 视频为旧编码（如 VP6，flv.js 仅支持 H.264 编码），浏览器无法播放。建议用格式工厂/ffmpeg 转码为 MP4（H.264）后再播放。';
+    }
+  } else {
+    $('player-hint').textContent = '⚠️ 该视频格式浏览器无法直接播放（编码不支持），可点击列表再次选择或换用支持 MP4/H.264 的文件。';
+  }
 });
 audioEl.addEventListener('error', () => {
   $('player-hint').textContent = '⚠️ 该音频格式浏览器无法直接播放。';
@@ -1382,7 +1582,14 @@ document.addEventListener('keydown', e => {
 });
 
 // 刷新/关闭页面时保存滚动位置（供刷新后恢复）
-window.addEventListener('pagehide', saveScrollState);
+// 刷新/关闭页面时：保存滚动位置 + 取消进行中的转码（keepalive 保证请求在卸载前发出）
+window.addEventListener('pagehide', () => {
+  saveScrollState();
+  if (transcodeCurrentRel) {
+    const qs = new URLSearchParams({ root: currentRoot, path: transcodeDstPath(transcodeCurrentRel) });
+    fetch('/local/api/transcode-cancel?' + qs.toString(), { keepalive: true }).catch(() => {});
+  }
+});
 
 // ============================================================
 // 浏览器前进/后退（popstate）或手动改 URL hash（hashchange）
