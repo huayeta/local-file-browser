@@ -521,8 +521,20 @@ function serveFile(req, res, url) {
     res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(name)}"`);
 
     if (!range) {
-      // 无 Range → 完整返回
-      res.statusCode = 200;
+      // .flv 文件：只返回 256KB 小块 + Content-Range 总大小——flv.js 首次探测
+      // 用开放范围请求获取总长度，若返回全量 body 会一路读完整个文件（全量下载）；
+      // 只给小块，flv.js 从 Content-Range 获知总长度后自动转 RangeLoader 分片
+      if (/\.flv$/i.test(name)) {
+        const small = Math.min(fileSize, 256 * 1024);
+        res.statusCode = 206;
+        res.setHeader('Content-Range', `bytes 0-${small - 1}/${fileSize}`);
+        res.setHeader('Content-Length', small);
+        pipeFile(res, full, { start: 0, end: small - 1, highWaterMark: 256 * 1024 });
+        return;
+      }
+      // 其他文件：206 + Content-Range（全量范围），让 flv.js/浏览器识别支持 Range
+      res.statusCode = 206;
+      res.setHeader('Content-Range', `bytes 0-${fileSize - 1}/${fileSize}`);
       res.setHeader('Content-Length', fileSize);
       pipeFile(res, full);
       return;
@@ -545,6 +557,11 @@ function serveFile(req, res, url) {
       return;
     }
     end = Math.min(end, fileSize - 1);
+    // .flv 开放范围请求（bytes=0- 覆盖全文件）：也只返回 256KB 小块——flv.js 首次
+    // 探测正是这种形态，若返回全量 body 会一路读完整个文件；只给小块让其转 RangeLoader 分片
+    if (/\.flv$/i.test(name) && start === 0 && end >= fileSize - 1) {
+      end = Math.min(fileSize - 1, 256 * 1024 - 1);
+    }
     const chunkSize = end - start + 1;
 
     res.statusCode = 206;

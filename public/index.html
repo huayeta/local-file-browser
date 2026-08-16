@@ -1135,7 +1135,18 @@ async function playFlvWithTranscode(e) {
       promptTranscode(e);  // flv.js 不可用 → 直接提示转码
       return;
     }
-    flvPlayer = flvjs.createPlayer({ type: 'flv', url: fileUrl(e), isLive: false });
+    flvPlayer = flvjs.createPlayer({
+      type: 'flv',
+      url: fileUrl(e),
+      isLive: false,
+      // 强制 Range 分片加载（而非 fetch 流式全量下载）：
+      //   · seekType:'range' 使用 RangeLoader（XHR 分片）
+      //   · rangeLoadZeroStart:true 从 0 开始也按 Range 请求
+      //   · stashInitialSize 缩小初始缓冲（256KB），避免首次拉取全量
+      seekType: 'range',
+      rangeLoadZeroStart: true,
+      stashInitialSize: 262144,
+    });
     flvPlayer.attachMediaElement(videoEl);
     flvPlayer.load();
     flvPlayer.play().catch(() => {});
