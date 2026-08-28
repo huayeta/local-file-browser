@@ -1064,7 +1064,7 @@ function destroyFlvPlayer() {
 let transcodeTimer = null;
 let transcodeCancelled = false;  // 用户点击取消转码时置位
 let transcodeCurrentRel = null;  // 当前正在转码的视频相对路径（取消按钮用，避免误用 currentPath）
-let flvFailTarget = null;        // 当前尝试播放的 flv 文件（播放失败 error 回调里弹转码用）
+let flvFailTarget = null;        // 当前尝试播放的视频文件（不限 .flv；播放失败 error 回调里弹转码用）
 
 // 同目录转码产物的相对路径（如 /a.flv → /a.mp4）
 function transcodeDstPath(relPath) {
@@ -1113,10 +1113,12 @@ async function cancelTranscode(rootIdx, relPath) {
   } catch (e) { return false; }
 }
 
-// .flv 播放入口：优先播放已有转码产物(.mp4)；否则先尝试 flv.js 直接播放，
-// 只有播放失败（多为 VP6 等旧编码）时才提示转码
-async function playFlvWithTranscode(e) {
+// 视频播放入口：优先播放已有转码产物(.mp4)；否则 .flv 先尝试 flv.js 直接播放，
+// 其他格式用 ffprobe 探测编码，浏览器不支持的编码 → 提示转码为 MP4；
+// 若实际播放仍失败（error）也会弹转码确认（覆盖探测不到的容器/编码）
+async function playVideoWithTranscode(e) {
   const rootIdx = currentRoot;
+  const isFlv = /\.flv$/i.test(e.name);
   const dstPath = transcodeDstPath(e.path);
   const st = await checkTranscodeStatus(rootIdx, dstPath);
   if (st.status === 'done') {
@@ -1127,33 +1129,56 @@ async function playFlvWithTranscode(e) {
     return;
   }
 
-  // 无转码产物 → 先尝试 flv.js 播放（H.264 编码的 FLV 可直接播，不打扰用户）
-  flvFailTarget = e;  // 记录文件，若播放失败(error)回调里用它弹转码
+  // 记录当前尝试播放的文件：若最终播放失败(error)，用它弹转码
+  flvFailTarget = e;
+
+  if (isFlv) {
+    // .flv：先尝试 flv.js 播放（H.264 编码的 FLV 可直接播，不打扰用户）
+    try {
+      const flvjs = await loadFlvjs();
+      if (!flvjs.isSupported()) {
+        promptTranscode(e);  // flv.js 不可用 → 直接提示转码
+        return;
+      }
+      flvPlayer = flvjs.createPlayer({
+        type: 'flv',
+        url: fileUrl(e),
+        isLive: false,
+        // 强制 Range 分片加载（而非 fetch 流式全量下载）：
+        //   · seekType:'range' 使用 RangeLoader（XHR 分片）
+        //   · rangeLoadZeroStart:true 从 0 开始也按 Range 请求
+        //   · stashInitialSize 缩小初始缓冲（256KB），避免首次拉取全量
+        seekType: 'range',
+        rangeLoadZeroStart: true,
+        stashInitialSize: 262144,
+      });
+      flvPlayer.attachMediaElement(videoEl);
+      flvPlayer.load();
+      flvPlayer.play().catch(() => {});
+      // 若该 FLV 编码 flv.js 也不支持（如 VP6），videoEl 会触发 error → 回调里弹转码
+    } catch (err) {
+      promptTranscode(e);
+    }
+    return;
+  }
+
+  // 非 .flv：用 ffprobe 探测编码，浏览器不支持的编码 → 提示转码
   try {
-    const flvjs = await loadFlvjs();
-    if (!flvjs.isSupported()) {
-      promptTranscode(e);  // flv.js 不可用 → 直接提示转码
+    const qs = new URLSearchParams({ root: rootIdx, path: e.path });
+    const res = await fetch('/local/api/probe?' + qs.toString());
+    const data = await res.json();
+    if (data && data.available && data.supported === false) {
+      // ffprobe 探测到浏览器不支持的编码 → 提示转码
+      promptTranscode(e);
       return;
     }
-    flvPlayer = flvjs.createPlayer({
-      type: 'flv',
-      url: fileUrl(e),
-      isLive: false,
-      // 强制 Range 分片加载（而非 fetch 流式全量下载）：
-      //   · seekType:'range' 使用 RangeLoader（XHR 分片）
-      //   · rangeLoadZeroStart:true 从 0 开始也按 Range 请求
-      //   · stashInitialSize 缩小初始缓冲（256KB），避免首次拉取全量
-      seekType: 'range',
-      rangeLoadZeroStart: true,
-      stashInitialSize: 262144,
-    });
-    flvPlayer.attachMediaElement(videoEl);
-    flvPlayer.load();
-    flvPlayer.play().catch(() => {});
-    // 若该 FLV 编码 flv.js 也不支持（如 VP6），videoEl 会触发 error → 回调里弹转码
-  } catch (err) {
-    promptTranscode(e);
-  }
+    // 编码受支持，或 ffprobe 不可用（无法确认）→ 直接播放；
+    // 若实际播放仍失败（浏览器容器/编码不支持），error 事件里再提示转码
+  } catch (err) { /* 探测接口异常 → 直接播放，播放失败再提示 */ }
+
+  currentIsFlv = false;
+  videoEl.src = fileUrl(e);
+  videoEl.play().catch(() => {});
 }
 
 // 弹"是否转码"确认；用户确认后启动转码并轮询（失败/取消均有明确提示）
@@ -1206,7 +1231,7 @@ $('transcode-cancel-btn').onclick = async () => {
     const st = await checkTranscodeStatus(currentRoot, dstPath);
     if (st.status === 'done') {
       $('player-hint').textContent = '转码已完成（无法取消），正在播放转好的 MP4…';
-      // 转码已完成 → 直接播放 MP4（复用 playFlvWithTranscode 的产物播放路径）
+      // 转码已完成 → 直接播放 MP4（复用 playVideoWithTranscode 的产物播放路径）
       const { currentRoot: rootIdx } = { currentRoot };
       videoEl.src = '/local/file?' + new URLSearchParams({ root: rootIdx, path: dstPath }).toString();
       videoEl.play().catch(() => {});
@@ -1226,13 +1251,8 @@ async function openPlayer(e) {
     videoEl.style.display = 'block';
     audioEl.style.display = 'none';
     currentIsFlv = /\.flv$/i.test(e.name);
-    // .flv 文件：优先检查转码产物（.mp4），否则提示用户选择是否转码；都不行才用 flv.js
-    if (currentIsFlv) {
-      playFlvWithTranscode(e);
-    } else {
-      videoEl.src = url;
-      videoEl.play().catch(() => {});
-    }
+    // 统一入口：优先播放转码产物(.mp4)，否则探测编码，浏览器不支持的编码 → 提示转码
+    playVideoWithTranscode(e);
   } else {
     audioEl.style.display = 'block';
     videoEl.style.display = 'none';
@@ -1326,18 +1346,16 @@ fsPlayToggle.onclick = () => {
 videoEl.addEventListener('play', syncPlayToggleIcon);
 videoEl.addEventListener('pause', syncPlayToggleIcon);
 
-// 视频播放失败提示（如浏览器不支持的编码格式，可提示下载）
+// 视频播放失败提示：浏览器不支持的编码 → 弹"是否转码"确认（所有视频格式通用）
 videoEl.addEventListener('error', () => {
   // 关闭播放器/清空 src 时也会触发 error 事件（src 已空）——忽略，不弹转码
   if (!videoEl.currentSrc) return;
-  // .flv 播放失败：先试过 flv.js 仍失败 → 多为旧编码（VP6/Sorenson）→ 弹转码确认
-  if (currentIsFlv) {
-    if (flvFailTarget) {
-      $('player-hint').textContent = '⚠️ 该 FLV 为旧编码（如 VP6，flv.js 仅支持 H.264），无法直接播放。';
-      promptTranscode(flvFailTarget);  // 弹"是否转码"确认
-    } else {
-      $('player-hint').textContent = '⚠️ 该 FLV 视频为旧编码（如 VP6，flv.js 仅支持 H.264 编码），浏览器无法播放。建议用格式工厂/ffmpeg 转码为 MP4（H.264）后再播放。';
-    }
+  if (flvFailTarget) {
+    // 正在尝试播放的文件播放失败 → 多为编码/容器不支持 → 弹转码确认
+    $('player-hint').textContent = '⚠️ 该视频编码浏览器无法直接播放，正在准备转码…';
+    promptTranscode(flvFailTarget);
+  } else if (currentIsFlv) {
+    $('player-hint').textContent = '⚠️ 该 FLV 视频为旧编码（如 VP6，flv.js 仅支持 H.264 编码），浏览器无法播放。建议用格式工厂/ffmpeg 转码为 MP4（H.264）后再播放。';
   } else {
     $('player-hint').textContent = '⚠️ 该视频格式浏览器无法直接播放（编码不支持），可点击列表再次选择或换用支持 MP4/H.264 的文件。';
   }

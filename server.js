@@ -629,7 +629,9 @@ function probeVideoCodec(full) {
       ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', full],
       (err, stdout) => {
         if (err) return resolve(null);
-        resolve(String(stdout).trim().toLowerCase() || null);
+        // csv 输出可能多行/带分隔符（实测如 "mpeg2video,\n"），取第一个有效字段，避免误判
+        const codec = String(stdout).trim().toLowerCase().split(/[\s,]+/)[0] || null;
+        resolve(codec);
       });
   });
 }
@@ -765,6 +767,30 @@ function apiTranscodeCancel(req, res, url) {
     try { if (fs.existsSync(dstFull + '.part')) fs.unlinkSync(dstFull + '.part'); } catch (e) {}
   }
   sendJson(res, 200, { ok: true, cancelled });
+}
+
+// API: /api/probe?root=<i>&path=<rel> — ffprobe 探测视频编码，判断浏览器是否支持
+// 返回 { codec, supported, available }：
+//   available=false 表示 ffprobe 不可用或探测失败（前端应直接播放，播放失败再提示转码）
+function apiProbe(req, res, url) {
+  const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
+  const root = CONFIG.roots[rootIndex];
+  if (!root) return sendJson(res, 400, { error: `无效的 root 索引: ${rootIndex}` });
+  const rel = url.searchParams.get('path') || '';
+  const resolved = resolveWithinRoot(root, rel);
+  if (!resolved.ok) return sendJson(res, resolved.status, { error: resolved.error });
+  const full = resolved.full;
+  let stat;
+  try { stat = fs.statSync(full); } catch (e) { return sendJson(res, 404, { error: '文件不存在' }); }
+  if (stat.isDirectory()) return sendJson(res, 400, { error: '这是文件夹，不能探测' });
+
+  probeVideoCodec(full).then((codec) => {
+    if (!codec) {
+      sendJson(res, 200, { codec: null, supported: false, available: false });
+      return;
+    }
+    sendJson(res, 200, { codec, supported: SUPPORTED_VIDEO_CODECS.has(codec), available: true });
+  });
 }
 
 // API: /api/transcode-status?root=<i>&path=<rel> — 查询转码状态（none/transcoding/done + 进度）
@@ -930,6 +956,8 @@ const server = http.createServer((req, res) => {
       apiTranscodeCancel(req, res, url);
     } else if (p === '/api/transcode-status') {
       apiTranscodeStatus(req, res, url);
+    } else if (p === '/api/probe') {
+      apiProbe(req, res, url);
     } else if (p.startsWith('/pdfjs/')) {
       // PDF.js 查看器静态资源（public/pdfjs/）
       servePdfjs(req, res, p);
