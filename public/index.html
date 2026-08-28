@@ -98,16 +98,38 @@
   }
   #back-btn:hover { border-color: var(--accent); }
   #file-list { list-style: none; }
+  /* 列表表头（名称/大小/修改日期，点击排序），与 .item.row 共用同一列宽对齐 */
+  #list-head {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) 150px 110px;
+    gap: 12px; align-items: center;
+    padding: 6px 14px; margin-bottom: 8px;
+    color: var(--muted); font-size: 12px;
+  }
+  #list-head .head-cell {
+    background: none; border: none; cursor: pointer;
+    color: var(--muted); font-size: 12px; font-family: inherit;
+    padding: 2px 0; white-space: nowrap; text-align: right;
+  }
+  #list-head .head-cell:hover { color: var(--text); }
+  #list-head .head-cell:first-of-type { text-align: left; }
+  #list-head .head-cell .arrow { color: var(--accent); }
   .item {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 14px; background: var(--panel);
     border: 1px solid var(--border); border-radius: 10px;
     margin-bottom: 8px; cursor: pointer; transition: all .15s;
   }
+  /* 目录视图条目：与表头对齐的多列布局（搜索视图保持原 flex 布局） */
+  .item.row {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) 150px 110px;
+    gap: 12px; align-items: center;
+  }
   .item:hover { border-color: var(--accent); background: var(--panel2); transform: translateX(2px); }
   .item .icon { font-size: 22px; width: 30px; text-align: center; flex-shrink: 0; }
   .item .name { flex: 1; font-size: 14px; word-break: break-all; }
-  .item .meta { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .item .meta { font-size: 12px; color: var(--muted); text-align: right; white-space: nowrap; flex-shrink: 0; }
   .item.dir .name { color: var(--dir); font-weight: 600; }
   .item.video .name { color: var(--video); }
   .item.audio .name { color: var(--audio); }
@@ -340,6 +362,12 @@
 <main>
   <div id="breadcrumb"></div>
   <div id="loading">加载中...</div>
+  <div id="list-head">
+    <span class="head-icon"></span>
+    <button class="head-cell" id="sort-name" title="按名称排序">名称<span class="arrow"></span></button>
+    <button class="head-cell" id="sort-mtime" title="按修改日期排序">修改日期<span class="arrow"></span></button>
+    <button class="head-cell" id="sort-size" title="按大小排序">大小<span class="arrow"></span></button>
+  </div>
   <ul id="file-list"></ul>
 </main>
 
@@ -404,11 +432,14 @@ let roots = [];        // 配置的根目录
 let currentRoot = 0;   // 当前根目录索引
 let currentPath = '';  // 当前相对路径（根目录内）
 let entries = [];      // 当前列表
+let sortKey = 'name';  // 目录列表排序字段: name | size | mtime
+let sortDir = 1;       // 1=升序, -1=降序
 
 const $ = id => document.getElementById(id);
 const fileListEl = $('file-list');
 const breadcrumbEl = $('breadcrumb');
 const loadingEl = $('loading');
+const listHeadEl = $('list-head');
 
 // 文件图标
 const ICONS = {
@@ -682,20 +713,73 @@ function formatSize(bytes) {
   return v.toFixed(1) + ' ' + units[u];
 }
 
+// ISO 时间 → "YYYY-MM-DD HH:mm"
+function formatMtime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 目录列表排序：隐藏文件最后、文件夹在前，再按所选列（名称/大小/修改日期）排序
+function sortEntries(list) {
+  return [...list].sort((a, b) => {
+    const ha = a.kind === 'hidden' ? 1 : 0;
+    const hb = b.kind === 'hidden' ? 1 : 0;
+    if (ha !== hb) return ha - hb;
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    let cmp = 0;
+    if (sortKey === 'size') {
+      cmp = (a.size || 0) - (b.size || 0);
+    } else if (sortKey === 'mtime') {
+      cmp = (Date.parse(a.mtime) || 0) - (Date.parse(b.mtime) || 0);
+    } else { // name
+      cmp = a.name.localeCompare(b.name, 'zh-CN');
+    }
+    // 同值以名称作次级排序，保证顺序稳定
+    return cmp !== 0 ? cmp * sortDir : a.name.localeCompare(b.name, 'zh-CN');
+  });
+}
+
+function setSort(key) {
+  if (sortKey === key) { sortDir = -sortDir; }  // 同列再次点击 → 切换升降序
+  else { sortKey = key; sortDir = 1; }          // 换列 → 默认升序
+  renderSortHead();
+  renderList();
+}
+
+// 更新表头箭头（▲ 升序 / ▼ 降序）
+function renderSortHead() {
+  const arrow = {
+    name: $('sort-name').querySelector('.arrow'),
+    size: $('sort-size').querySelector('.arrow'),
+    mtime: $('sort-mtime').querySelector('.arrow'),
+  };
+  arrow.name.textContent = arrow.size.textContent = arrow.mtime.textContent = '';
+  arrow[sortKey].textContent = sortDir === 1 ? ' ▲' : ' ▼';
+}
+$('sort-name').onclick = () => setSort('name');
+$('sort-size').onclick = () => setSort('size');
+$('sort-mtime').onclick = () => setSort('mtime');
+
 function renderList() {
   loadingEl.style.display = 'none';
+  listHeadEl.style.display = 'grid';   // 目录视图显示表头
   fileListEl.innerHTML = '';
   if (entries.length === 0) {
     fileListEl.innerHTML = '<li class="empty">📂 此文件夹为空</li>';
     return;
   }
-  entries.forEach(e => {
+  renderSortHead();
+  sortEntries(entries).forEach(e => {
     const li = document.createElement('li');
     // 访问过的文件/目录加 .visited 类（淡紫色标识）
-    li.className = 'item ' + e.kind + (isVisited(e) ? ' visited' : '');
+    li.className = 'item row ' + e.kind + (isVisited(e) ? ' visited' : '');
     li.innerHTML = `
       <span class="icon">${ICONS[e.kind] || '📦'}</span>
       <span class="name">${escapeHtml(e.name)}</span>
+      <span class="meta">${formatMtime(e.mtime)}</span>
       <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
     `;
     li.onclick = () => {
@@ -915,6 +999,7 @@ async function doSearch(q) {
   }
 
   loadingEl.style.display = 'block';
+  listHeadEl.style.display = 'none';   // 进入搜索：隐藏目录表头
   fileListEl.innerHTML = '';
   breadcrumbEl.innerHTML = '';
   try {
@@ -972,6 +1057,7 @@ function shortenPath(p) {
 // 渲染搜索结果视图：类型过滤（前端过滤已返回结果）+ 高亮 + 路径
 function renderSearchResults() {
   loadingEl.style.display = 'none';
+  listHeadEl.style.display = 'none';   // 搜索视图无表头（布局与目录视图不同）
   fileListEl.innerHTML = '';
 
   const type = searchTypeSel.value;
