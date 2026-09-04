@@ -461,6 +461,7 @@ let entries = [];      // 当前列表
 let sortKey = 'name';  // 目录列表排序字段: name | size | mtime
 let sortDir = 1;       // 1=升序, -1=降序
 let cloudVodServer = '';  // 云点播服务地址（可配置，从 /api/roots 读取；播放不兼容格式时的"云点播播放"选项）
+const CLOUD_VOD_BASE_PATH = '/vod';  // 云点播服务统一路径前缀（与 cloud-vod-player 的 basePath 一致）
 let cloudPlayer = null;   // 云点播播放器实例（CloudVodPlayer）
 let cloudSdkPromise = null;  // embed.js 动态加载 promise（避免重复加载）
 let pendingChoice = null;    // 当前待选择的视频文件（三选一弹框）
@@ -1370,6 +1371,7 @@ function playWithCloudVod(e) {
       cloudPlayer = new CloudVodPlayer(wrap, {
         url: absUrl,
         server: cloudVodServer,
+        basePath: CLOUD_VOD_BASE_PATH,
         autoplay: true,
       });
       cloudPlayer.on('error', (err) => {
@@ -1389,7 +1391,8 @@ function loadCloudSdk() {
   if (cloudSdkPromise) return cloudSdkPromise;
   cloudSdkPromise = new Promise((resolve, reject) => {
     const s = document.createElement('script');
-    s.src = cloudVodServer.replace(/\/+$/, '') + '/embed.js';
+    // 云点播服务所有资源请求统一加 /vod 路径前缀（cloud-vod-player basePath）
+    s.src = cloudVodServer.replace(/\/+$/, '') + CLOUD_VOD_BASE_PATH + '/embed.js';
     s.onload = () => resolve();
     s.onerror = () => { cloudSdkPromise = null; reject(new Error('embed.js 加载失败')); };
     document.head.appendChild(s);
