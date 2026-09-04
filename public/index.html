@@ -1353,6 +1353,19 @@ async function startLocalTranscode(e) {
   }
 }
 
+// 重建云点播播放器容器：embed.js 的 destroy() 只清空 innerHTML，不移除 shadow root；
+// 第二次 new CloudVodPlayer 时 attachShadow 会因"host already has a shadow root"抛错。
+// 因此每次创建前用一个全新的同 id div 替换旧容器（新元素无 shadow root）。
+function resetCloudPlayerContainer() {
+  const old = $('cloud-player');
+  if (!old) return null;
+  const fresh = document.createElement('div');
+  fresh.id = 'cloud-player';
+  fresh.style.cssText = old.style.cssText;
+  old.parentNode.replaceChild(fresh, old);
+  return fresh;
+}
+
 // 用云点播服务播放（cloud-vod-player：任意格式实时转 HLS）：
 // 动态加载其 embed.js SDK，传入本地文件绝对 URL 与可配置的云点播服务地址
 function playWithCloudVod(e) {
@@ -1360,13 +1373,13 @@ function playWithCloudVod(e) {
   videoEl.pause(); videoEl.style.display = 'none';
   audioEl.pause(); audioEl.style.display = 'none';
   destroyFlvPlayer();
-  const wrap = $('cloud-player');
+  // 重建容器：确保无残留 shadow root，避免第二次 attachShadow 失败
+  const wrap = resetCloudPlayerContainer();
   wrap.style.display = 'block';
   // 本地文件绝对 URL（云服务端需抓取该地址；相对路径在云服务 origin 下无法解析）
   const absUrl = location.origin + fileUrl(e);
   loadCloudSdk().then(() => {
     if (cloudPlayer) { try { cloudPlayer.destroy(); } catch (err) {} cloudPlayer = null; }
-    wrap.innerHTML = '';
     try {
       cloudPlayer = new CloudVodPlayer(wrap, {
         url: absUrl,
@@ -1455,9 +1468,9 @@ async function openPlayer(e) {
 
 function closePlayer() {
   destroyFlvPlayer();
-  // 销毁云点播播放器并隐藏其容器
+  // 销毁云点播播放器并重建容器（移除残留 shadow root，避免下次 attachShadow 失败）
   if (cloudPlayer) { try { cloudPlayer.destroy(); } catch (err) {} cloudPlayer = null; }
-  $('cloud-player').style.display = 'none';
+  resetCloudPlayerContainer();
   $('choice-bar').style.display = 'none';
   // 转码进行中：关闭弹窗 → 停止前端轮询 + 取消后台转码（kill ffmpeg + 清理 .part）
   if (transcodeCurrentRel) {
