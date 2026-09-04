@@ -201,6 +201,24 @@
   }
   #fs-exit-toggle:hover { background: rgba(0,0,0,.8); transform: scale(1.08); }
   #player-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  /* 云点播播放器容器（embed.js Shadow DOM 渲染，样式与宿主隔离） */
+  #cloud-player { width: 100%; max-height: 55vh; border-radius: 8px; overflow: hidden; background: #000; }
+  /* 不兼容格式三选一选择条 */
+  #choice-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-top: 8px; padding: 10px 12px; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 10px; font-size: 13px;
+  }
+  #choice-bar .choice-text { color: var(--text); flex: 1; min-width: 180px; }
+  #choice-bar button {
+    border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); border-radius: 8px; padding: 6px 14px;
+    cursor: pointer; font-size: 13px; transition: all .15s;
+  }
+  #choice-bar button:hover { border-color: var(--accent); }
+  #choice-transcode { color: var(--accent); }
+  #choice-cloud { color: var(--audio); border-color: var(--audio); }
+  #choice-cloud:hover { border-color: var(--audio); background: rgba(81, 207, 102, .12); }
 
   /* 文本预览浮层 */
   #text-overlay {
@@ -383,8 +401,16 @@
     <button id="fs-exit-toggle" title="退出全屏" style="display:none">⛶</button>
     <button id="fs-play-toggle" title="播放/暂停" style="display:none">⏸</button>
   </div>
+  <div id="cloud-player" style="display:none"></div>
   <audio id="player-audio" controls preload="auto" style="display:none"></audio>
   <div id="player-hint"></div>
+  <!-- 不兼容格式三选一：取消 / 转换(本地转码MP4) / 云点播播放 -->
+  <div id="choice-bar" style="display:none">
+    <span class="choice-text">该视频浏览器无法直接播放，请选择处理方式：</span>
+    <button id="choice-cancel">取消</button>
+    <button id="choice-transcode">转换（MP4）</button>
+    <button id="choice-cloud">云点播播放</button>
+  </div>
   <button id="transcode-cancel-btn" style="display:none">✕ 取消转码</button>
 </div>
 
@@ -434,6 +460,10 @@ let currentPath = '';  // 当前相对路径（根目录内）
 let entries = [];      // 当前列表
 let sortKey = 'name';  // 目录列表排序字段: name | size | mtime
 let sortDir = 1;       // 1=升序, -1=降序
+let cloudVodServer = '';  // 云点播服务地址（可配置，从 /api/roots 读取；播放不兼容格式时的"云点播播放"选项）
+let cloudPlayer = null;   // 云点播播放器实例（CloudVodPlayer）
+let cloudSdkPromise = null;  // embed.js 动态加载 promise（避免重复加载）
+let pendingChoice = null;    // 当前待选择的视频文件（三选一弹框）
 
 const $ = id => document.getElementById(id);
 const fileListEl = $('file-list');
@@ -548,6 +578,8 @@ async function loadRoots() {
     roots = data.roots || [];
     // 读取 PDF 预加载页数配置（热重载后重新拉取生效）
     if (data.pdfPreloadPages > 0) pdfPreloadPages = data.pdfPreloadPages;
+    // 读取云点播服务地址（可配置；未配置时"云点播播放"按钮不显示）
+    if (data.cloudVodServer) cloudVodServer = data.cloudVodServer;
     const bar = $('roots-bar');
     bar.innerHTML = '';
     roots.forEach(r => {
@@ -1223,7 +1255,7 @@ async function playVideoWithTranscode(e) {
     try {
       const flvjs = await loadFlvjs();
       if (!flvjs.isSupported()) {
-        promptTranscode(e);  // flv.js 不可用 → 直接提示转码
+        promptChoice(e);  // flv.js 不可用 → 直接提示转码
         return;
       }
       flvPlayer = flvjs.createPlayer({
@@ -1243,7 +1275,7 @@ async function playVideoWithTranscode(e) {
       flvPlayer.play().catch(() => {});
       // 若该 FLV 编码 flv.js 也不支持（如 VP6），videoEl 会触发 error → 回调里弹转码
     } catch (err) {
-      promptTranscode(e);
+      promptChoice(e);
     }
     return;
   }
@@ -1255,7 +1287,7 @@ async function playVideoWithTranscode(e) {
     const data = await res.json();
     if (data && data.available && data.supported === false) {
       // ffprobe 探测到浏览器不支持的编码 → 提示转码
-      promptTranscode(e);
+      promptChoice(e);
       return;
     }
     // 编码受支持，或 ffprobe 不可用（无法确认）→ 直接播放；
@@ -1267,12 +1299,31 @@ async function playVideoWithTranscode(e) {
   videoEl.play().catch(() => {});
 }
 
-// 弹"是否转码"确认；用户确认后启动转码并轮询（失败/取消均有明确提示）
-async function promptTranscode(e) {
-  if (!confirm('该视频编码浏览器无法直接播放，是否转码为 MP4？（转码产物与原文件并存，不删除源文件）')) {
-    $('player-hint').textContent = '未转码。如仍需播放，可再次点击该文件并选择转码。';
-    return;
-  }
+// 弹"取消 / 转换 / 云点播播放"三选一（云点播服务未配置时隐藏云播按钮）
+function promptChoice(e) {
+  pendingChoice = e;
+  $('choice-cloud').style.display = cloudVodServer ? '' : 'none';
+  $('choice-bar').style.display = 'flex';
+}
+
+$('choice-cancel').onclick = () => {
+  $('choice-bar').style.display = 'none';
+  $('player-hint').textContent = '未处理。如仍需播放，可再次点击该文件并选择处理方式。';
+  pendingChoice = null;
+};
+$('choice-transcode').onclick = () => {
+  $('choice-bar').style.display = 'none';
+  const e = pendingChoice; pendingChoice = null;
+  if (e) startLocalTranscode(e);
+};
+$('choice-cloud').onclick = () => {
+  $('choice-bar').style.display = 'none';
+  const e = pendingChoice; pendingChoice = null;
+  if (e) playWithCloudVod(e);
+};
+
+// 本地转码为 MP4：启动转码并轮询（失败/取消均有明确提示）
+async function startLocalTranscode(e) {
   const rootIdx = currentRoot;
   const dstPath = transcodeDstPath(e.path);
   // 启动转码并轮询，显示取消按钮（可中途取消，后台同步 kill ffmpeg）
@@ -1299,6 +1350,51 @@ async function promptTranscode(e) {
   } else {
     $('player-hint').textContent = '❌ 转码失败，源文件未受影响。';
   }
+}
+
+// 用云点播服务播放（cloud-vod-player：任意格式实时转 HLS）：
+// 动态加载其 embed.js SDK，传入本地文件绝对 URL 与可配置的云点播服务地址
+function playWithCloudVod(e) {
+  $('player-hint').textContent = '⏳ 正在连接云点播服务…';
+  videoEl.pause(); videoEl.style.display = 'none';
+  audioEl.pause(); audioEl.style.display = 'none';
+  destroyFlvPlayer();
+  const wrap = $('cloud-player');
+  wrap.style.display = 'block';
+  // 本地文件绝对 URL（云服务端需抓取该地址；相对路径在云服务 origin 下无法解析）
+  const absUrl = location.origin + fileUrl(e);
+  loadCloudSdk().then(() => {
+    if (cloudPlayer) { try { cloudPlayer.destroy(); } catch (err) {} cloudPlayer = null; }
+    wrap.innerHTML = '';
+    try {
+      cloudPlayer = new CloudVodPlayer(wrap, {
+        url: absUrl,
+        server: cloudVodServer,
+        autoplay: true,
+      });
+      cloudPlayer.on('error', (err) => {
+        $('player-hint').textContent = '⚠️ 云点播播放失败：' + ((err && (err.text || err.title)) || '未知错误');
+      });
+    } catch (err) {
+      $('player-hint').textContent = '⚠️ 云点播初始化失败：' + err.message;
+    }
+  }).catch(() => {
+    $('player-hint').textContent = '⚠️ 无法加载云点播播放器（' + cloudVodServer + '），请检查 cloudVodServer 配置与该服务是否已启动。';
+  });
+}
+
+// 动态加载云点播 SDK（embed.js），避免重复加载
+function loadCloudSdk() {
+  if (window.CloudVodPlayer) return Promise.resolve();
+  if (cloudSdkPromise) return cloudSdkPromise;
+  cloudSdkPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = cloudVodServer.replace(/\/+$/, '') + '/embed.js';
+    s.onload = () => resolve();
+    s.onerror = () => { cloudSdkPromise = null; reject(new Error('embed.js 加载失败')); };
+    document.head.appendChild(s);
+  });
+  return cloudSdkPromise;
 }
 
 // 取消转码按钮：点击 → 通知后台 kill ffmpeg + 清理 .part，并停止前端轮询
@@ -1328,6 +1424,10 @@ $('transcode-cancel-btn').onclick = async () => {
 };
 
 async function openPlayer(e) {
+  // 清理上一轮的云点播播放器与三选一状态
+  if (cloudPlayer) { try { cloudPlayer.destroy(); } catch (err) {} cloudPlayer = null; }
+  $('cloud-player').style.display = 'none';
+  $('choice-bar').style.display = 'none';
   const url = fileUrl(e);
   $('player-title').textContent = (e.kind === 'video' ? '🎬 ' : '🎵 ') + e.name;
   $('player-hint').textContent = '';
@@ -1352,6 +1452,10 @@ async function openPlayer(e) {
 
 function closePlayer() {
   destroyFlvPlayer();
+  // 销毁云点播播放器并隐藏其容器
+  if (cloudPlayer) { try { cloudPlayer.destroy(); } catch (err) {} cloudPlayer = null; }
+  $('cloud-player').style.display = 'none';
+  $('choice-bar').style.display = 'none';
   // 转码进行中：关闭弹窗 → 停止前端轮询 + 取消后台转码（kill ffmpeg + 清理 .part）
   if (transcodeCurrentRel) {
     transcodeCancelled = true;
@@ -1439,7 +1543,7 @@ videoEl.addEventListener('error', () => {
   if (flvFailTarget) {
     // 正在尝试播放的文件播放失败 → 多为编码/容器不支持 → 弹转码确认
     $('player-hint').textContent = '⚠️ 该视频编码浏览器无法直接播放，正在准备转码…';
-    promptTranscode(flvFailTarget);
+    promptChoice(flvFailTarget);
   } else if (currentIsFlv) {
     $('player-hint').textContent = '⚠️ 该 FLV 视频为旧编码（如 VP6，flv.js 仅支持 H.264 编码），浏览器无法播放。建议用格式工厂/ffmpeg 转码为 MP4（H.264）后再播放。';
   } else {

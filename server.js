@@ -225,6 +225,7 @@ function apiRoots(req, res) {
     roots: CONFIG.roots.map((r, i) => ({ index: i, name: r.name, path: r.path })),
     shortcuts,
     pdfPreloadPages: CONFIG.pdfPreloadPages || 3,  // PDF 预加载页数（前端滑动窗口用）
+    cloudVodServer: CONFIG.cloudVodServer || '',   // 云点播服务地址（播放不兼容格式时的"云点播播放"选项）
   });
 }
 

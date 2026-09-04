@@ -8,6 +8,7 @@
   "searchMaxResults": 200,
   "ffmpegPath": "ffmpeg",
   "ffprobePath": "ffprobe",
+  "cloudVodServer": "http://localhost:8787",
   "roots": [
     {
       "name": "视频库",
