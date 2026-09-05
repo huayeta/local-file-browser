@@ -579,8 +579,15 @@ async function loadRoots() {
     roots = data.roots || [];
     // 读取 PDF 预加载页数配置（热重载后重新拉取生效）
     if (data.pdfPreloadPages > 0) pdfPreloadPages = data.pdfPreloadPages;
-    // 读取云点播服务地址（可配置；未配置时"云点播播放"按钮不显示）
-    if (data.cloudVodServer) cloudVodServer = data.cloudVodServer;
+    // 读取云点播服务地址：
+    // - 完整 URL（如 http://localhost:8787）→ 用指定地址
+    // - "current" 或 "self" → 用当前页面 origin（适合云点播反向代理到同域名下）
+    // - 空/未配置 → 不启用云点播按钮
+    if (data.cloudVodServer === 'current' || data.cloudVodServer === 'self') {
+      cloudVodServer = window.location.origin;
+    } else if (data.cloudVodServer) {
+      cloudVodServer = data.cloudVodServer;
+    }
     const bar = $('roots-bar');
     bar.innerHTML = '';
     roots.forEach(r => {
