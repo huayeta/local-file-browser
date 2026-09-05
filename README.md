@@ -14,7 +14,7 @@
 | 文件类型 | 点击行为 |
 |---|---|
 | 文件夹 | 进入该文件夹列表 |
-| 视频 (mp4/webm/mov/m4v/ogv…) | 页面内嵌播放，支持拖动进度条（HTTP Range 206 分片） |
+| 视频 (mp4/webm/mov/m4v/ogv…) | 页面内嵌播放，支持拖动进度条（HTTP Range 206 分片）；浏览器不支持的格式（avi/mkv/flv/wmv…）可选择本地转码 MP4 或云点播播放 |
 | 音频 (mp3/wav/m4a/flac…) | 页面内嵌播放 |
 | PDF | 浏览器内置阅读器在线查看，支持分片渐进加载（大文件秒开） |
 | 图片 (jpg/png/gif/webp…) | 新标签页查看 |
@@ -80,12 +80,47 @@ node server.js
 | `searchMaxResults` | 搜索返回结果上限（条） | 200 |
 | `ffmpegPath` | ffmpeg 可执行文件路径（视频转码用）。Windows 需填完整路径如 `C:\ffmpeg\bin\ffmpeg.exe` | ffmpeg |
 | `ffprobePath` | ffprobe 可执行文件路径（视频编码检测用） | ffprobe |
+| `cloudVodServer` | 云点播服务地址：完整 URL（如 `http://localhost:8787`）用指定地址；`"current"` 或 `"self"` 用当前页面 origin（需反向代理 `/vod/` 到云点播服务）；留空不启用云点播按钮 | 可选 |
 | `roots` | 根目录数组：`name` 显示名、`path` 本地绝对路径 | 必填 |
 | `shortcuts` | 快捷访问：`root` 根目录索引（对应 roots 顺序）、`path` 该根目录内的相对路径 | 可选 |
 
 > 修改 config.json 后自动热重载，无需重启进程。
 >
 > **视频转码依赖**：浏览器无法直接播放的视频（如 VP6 编码的 .flv）会在播放时提示是否转码为 MP4。转码需要安装 ffmpeg/ffprobe 并配置上方两个路径（macOS 可用 `brew install ffmpeg`；Windows 到 ffmpeg 官网下载后填完整路径）。
+
+## ☁️ 云点播播放
+
+对于浏览器无法直接播放的视频格式（avi、mkv、flv、wmv 等），点击播放时会弹出三选一对话框：
+
+- **取消**：关闭对话框，不播放
+- **转换**：本地 ffmpeg 转码为 MP4 后播放（耗时取决于文件大小，转码期间可取消）
+- **云点播播放**：通过 [cloud-vod-player](https://github.com/huayeta/cloud-video-player) 服务实时转码为 HLS 播放，支持拖动进度条、seek 到任意位置（未缓存区域会自动创建新转码会话）
+
+### 配置云点播服务
+
+在 `config.json` 中设置 `cloudVodServer`：
+
+```json
+{
+  "cloudVodServer": "http://localhost:8787"
+}
+```
+
+| 配置值 | 说明 |
+|---|---|
+| `"http://localhost:8787"` | 用指定地址请求云点播服务（独立端口/域名部署时用此模式） |
+| `"current"` 或 `"self"` | 用当前页面的 origin（`window.location.origin`）作为云点播地址，适合把 cloud-vod-player 反向代理到同域名下 |
+| 留空 / 不配置 | 不显示"云点播播放"按钮 |
+
+使用 `"current"` 模式时，需配置反向代理把 `/vod/*` 路径代理到 cloud-vod-player 服务（默认端口 8787，basePath 为 `/vod`）：
+
+```nginx
+location /vod/ {
+    proxy_pass http://localhost:8787/vod/;
+}
+```
+
+cloud-vod-player 所有资源（embed.js、m3u8、视频分片、API）都在 `/vod/` 路径下，反向代理这一个前缀即可。
 
 ## 📡 API
 
