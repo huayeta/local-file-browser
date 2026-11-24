@@ -165,18 +165,79 @@
   }
   #player-fullscreen:hover { color: #fff; border-color: var(--accent); }
   #video-wrap { position: relative; }
-  /* 全屏时右下角的大播放/暂停按钮（bottom 抬高避开原生控制条） */
+  /* 全屏时右下角的大播放/暂停按钮（bottom 抬高避开原生控制条），外圈是播放进度环 */
+  #fs-play-wrap {
+    position: absolute; right: 14px; bottom: 94px;
+    width: 84px; height: 84px;
+    display: none; place-items: center;
+    z-index: 10;
+    cursor: pointer;
+    scale: 1;  /* 基线值：避免只在 :hover 时创建层叠上下文导致跳动 */
+    transition: scale .15s ease-out;
+  }
+  /* 进度环与按钮一起缩放：环不会被放大的按钮盖住，动画完全同步 */
+  #fs-play-wrap:hover { scale: 1.08; }
+  #fs-play-wrap:active { scale: .95; }
+  /* 不支持独立 transform 属性的旧浏览器回退 */
+  @supports not (scale: 1) {
+    #fs-play-wrap { transition: transform .15s ease-out; }
+    #fs-play-wrap:hover { transform: scale(1.08); }
+    #fs-play-wrap:active { transform: scale(.95); }
+  }
   #fs-play-toggle {
-    position: absolute; right: 20px; bottom: 100px;
     width: 72px; height: 72px; border-radius: 50%;
     border: 2px solid rgba(255,255,255,.7);
     background: rgba(0,0,0,.55); color: #fff;
     font-size: 30px; line-height: 1; cursor: pointer;
-    display: none; align-items: center; justify-content: center;
-    z-index: 10; transition: background .15s, transform .1s;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .15s;
   }
-  #fs-play-toggle:hover { background: rgba(0,0,0,.8); transform: scale(1.08); }
-  #fs-play-toggle:active { transform: scale(.95); }
+  #fs-play-toggle:hover { background: rgba(0,0,0,.8); }
+  #fs-play-toggle:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 3px;
+  }
+
+  /* 进度环：<progress> 提供语义与可访问值，conic-gradient 画环，--value 由 JS 同步。
+     注册为数值属性后可平滑过渡；尊重 prefers-reduced-motion（默认无动画）。 */
+  @property --value {
+    syntax: '<number>';
+    inherits: true;
+    initial-value: 0;
+  }
+  #fs-progress-ring {
+    --size: 84px;
+    --thickness: 4px;
+    --fill-color: var(--accent);
+    --track-color: rgba(255,255,255,.25);
+    position: absolute; inset: 0;
+    width: var(--size); height: var(--size);
+    border-radius: 50%;
+    background: conic-gradient(var(--fill-color) calc(var(--value) * 1%), var(--track-color) 0);
+    border: var(--thickness) solid transparent;
+    background-clip: border-area;
+    background-origin: border-box;
+    pointer-events: none;  /* 环不遮挡按钮点击 */
+    transition: --value 0s linear;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    #fs-progress-ring { transition-duration: .2s; }
+  }
+  /* 隐藏原生进度条，避免内容区出现默认长条 */
+  #fs-progress-ring::-webkit-progress-bar,
+  #fs-progress-ring::-webkit-progress-value { display: none; background: none; }
+  #fs-progress-ring::-moz-progress-bar { display: none; background: none; }
+  #fs-progress-ring::slider-fill { display: none; background: none; }
+  /* background-clip: border-area 在部分浏览器不支持，用 mask 掏空环心（等效效果） */
+  @supports not (background-clip: border-area) {
+    #fs-progress-ring {
+      -webkit-mask-image: radial-gradient(closest-side, transparent calc(100% - var(--thickness)), #000 calc(100% - var(--thickness) + 0.5px));
+      mask-image: radial-gradient(closest-side, transparent calc(100% - var(--thickness)), #000 calc(100% - var(--thickness) + 0.5px));
+      border: 0;
+    }
+  }
+  @media (forced-colors: active) {
+    #fs-progress-ring { forced-color-adjust: none; --fill-color: CanvasText; --track-color: Canvas; }
+  }
   #player-overlay video, #player-overlay audio { width: 100%; max-height: 55vh; border-radius: 8px; background: #000; }
   #player-overlay audio { height: 46px; }
   /* 全屏时视频占满整个容器（覆盖上面的 max-height: 55vh 限制，含 Safari 前缀） */
@@ -399,7 +460,10 @@
   <div id="video-wrap">
     <video id="player-video" controls preload="auto" style="display:none"></video>
     <button id="fs-exit-toggle" title="退出全屏" style="display:none">⛶</button>
-    <button id="fs-play-toggle" title="播放/暂停" style="display:none">⏸</button>
+    <div id="fs-play-wrap" style="display:none">
+      <progress id="fs-progress-ring" value="0" max="100" aria-label="视频播放进度"></progress>
+      <button id="fs-play-toggle" title="播放/暂停">⏸</button>
+    </div>
   </div>
   <div id="cloud-player" style="display:none"></div>
   <audio id="player-audio" controls preload="auto" style="display:none"></audio>
@@ -1487,6 +1551,8 @@ $('player-close').onclick = closePlayer;
 // ============================================================
 const videoWrap = $('video-wrap');
 const fsPlayToggle = $('fs-play-toggle');
+const fsPlayWrap = $('fs-play-wrap');
+const fsProgressRing = $('fs-progress-ring');
 const fsExitToggle = $('fs-exit-toggle');
 const fullscreenBtn = $('player-fullscreen');
 
@@ -1514,9 +1580,9 @@ function updateFullscreenUI() {
   const fs = isFullscreen();
   fullscreenBtn.textContent = fs ? '⛶ 退出' : '⛶';
   fullscreenBtn.title = fs ? '退出全屏' : '全屏播放';
-  fsPlayToggle.style.display = fs ? 'block' : 'none';
+  fsPlayWrap.style.display = fs ? 'grid' : 'none';
   fsExitToggle.style.display = fs ? 'block' : 'none';
-  if (fs) syncPlayToggleIcon();
+  if (fs) { syncPlayToggleIcon(); syncPlayProgress(); }
 }
 
 fullscreenBtn.onclick = toggleFullscreen;
@@ -1544,6 +1610,18 @@ fsPlayToggle.onclick = () => {
 };
 videoEl.addEventListener('play', syncPlayToggleIcon);
 videoEl.addEventListener('pause', syncPlayToggleIcon);
+
+// 全屏播放进度环：<progress> 是语义真源，CSS --value 驱动环形填充。
+// attr() 在 Safari 不可用，故 JS 同步 value 属性与 --value（guide 的推荐回退）。
+function syncPlayProgress() {
+  const d = videoEl.duration;
+  const pct = (Number.isFinite(d) && d > 0) ? (videoEl.currentTime / d) * 100 : 0;
+  const v = Math.max(0, Math.min(100, pct));
+  fsProgressRing.value = v;
+  fsProgressRing.style.setProperty('--value', v.toFixed(2));
+}
+['timeupdate', 'loadedmetadata', 'durationchange', 'seeked'].forEach(evt =>
+  videoEl.addEventListener(evt, syncPlayProgress));
 
 // 视频播放失败提示：浏览器不支持的编码 → 弹"是否转码"确认（所有视频格式通用）
 videoEl.addEventListener('error', () => {
