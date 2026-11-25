@@ -42,6 +42,14 @@
   }
   .root-btn:hover { border-color: var(--accent); }
   .root-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  /* 顶部静态页入口 */
+  .nav-link {
+    background: var(--panel2); color: var(--dir);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 14px; font-size: 13px; text-decoration: none;
+    white-space: nowrap; transition: all .15s;
+  }
+  .nav-link:hover { border-color: var(--dir); color: #fff; }
 
   /* 快捷访问栏（⭐ 直达常用文件夹） */
   #shortcuts-bar {
@@ -314,12 +322,14 @@
   #pdf-overlay.show { display: flex; }
   #pdf-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   #pdf-title { font-size: 13px; color: var(--text); flex: 1; word-break: break-all; }
-  #pdf-close {
+  #pdf-close, #pdf-open-new {
     background: var(--panel2); border: 1px solid var(--border);
     color: var(--muted); border-radius: 6px; padding: 3px 10px;
-    cursor: pointer; font-size: 12px;
+    cursor: pointer; font-size: 12px; text-decoration: none;
+    display: inline-block; white-space: nowrap;
   }
-  #pdf-close:hover { color: #fff; border-color: var(--accent); }
+  #pdf-close:hover, #pdf-open-new:hover { color: #fff; border-color: var(--accent); }
+  #pdf-open-new { color: var(--accent); }
   #pdf-body {
     flex: 1; overflow: auto; display: flex; justify-content: flex-start; align-items: flex-start;
     background: #0a0e18; border: 1px solid var(--border); border-radius: 8px; padding: 12px;
@@ -420,6 +430,7 @@
 
 <header>
   <h1>📂 本地文件浏览器</h1>
+  <a class="nav-link" href="/local/static/maths/index.html">📊 课本⇄导引对接表</a>
   <div id="roots-bar"><span style="color:var(--muted);font-size:13px">加载根目录...</span></div>
   <div id="shortcuts-bar" style="display:none"></div>
   <div id="search-box">
@@ -492,6 +503,7 @@
 <div id="pdf-overlay">
   <div id="pdf-head">
     <span id="pdf-title"></span>
+    <a id="pdf-open-new" href="#" target="_blank" rel="noopener noreferrer">↗ 新窗口打开</a>
     <button id="pdf-close">✕ 关闭</button>
   </div>
   <div id="pdf-body">
@@ -1698,6 +1710,7 @@ const pdfOverlay = $('pdf-overlay');
 const pdfCanvas = $('pdf-canvas');
 const pdfLoadingEl = $('pdf-loading');
 const pdfPageInfo = $('pdf-page-info');
+const pdfOpenNew = $('pdf-open-new');
 let pdfDoc = null;          // 当前 PDF 文档对象
 let pdfPageNum = 1;         // 当前页
 let pdfLoadTask = null;     // 当前加载任务（用于中断）
@@ -1728,6 +1741,8 @@ function getPdfPos() {
 
 async function openPdfPreview(e) {
   $('pdf-title').textContent = '📄 ' + e.name;
+  // 新窗口打开的是同一个 /file 原始地址（浏览器内置 PDF 阅读器，支持下载/打印）
+  pdfOpenNew.href = fileUrl(e);
   $('pdf-hint').textContent = '';
   pdfLoadingEl.style.display = 'block';
   pdfCanvas.style.display = 'none';

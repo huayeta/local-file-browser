@@ -131,6 +131,7 @@ cloud-vod-player 所有资源（embed.js、m3u8、视频分片、API）都在 `/
 | `GET /api/list?root=0&path=/子目录` | 列出某根目录下某路径的文件列表（JSON，文件夹排前） |
 | `GET /file?root=0&path=/xxx.mp4` | 读取文件：视频/音频/PDF 支持 Range 206 分片，PDF/图片/文本 inline 查看，其他 attachment 下载 |
 | `GET /api/reload` | 手动重载 config.json（与自动热重载等效） |
+| `GET /static/<相对路径>` | 提供 `public/` 下的通用静态资源（白名单扩展名，如 `/static/maths/index.html`） |
 
 响应头 `X-Cache: HIT / MISS` 标识目录列表是否命中缓存。
 

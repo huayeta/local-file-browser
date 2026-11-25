@@ -888,6 +888,73 @@ function serveFlvjs(req, res, p) {
 }
 
 // ============================================================
+// 静态文件：public/ 下的通用静态资源（/static/*）
+//   仅白名单扩展名 + realpath 越界校验，避免暴露配置、脚本等非静态文件
+// ============================================================
+const PUBLIC_DIR = path.join(__dirname, 'public');
+let PUBLIC_REAL;
+try { PUBLIC_REAL = fs.realpathSync(PUBLIC_DIR); } catch (e) { PUBLIC_REAL = PUBLIC_DIR; }
+const STATIC_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+
+function serveStatic(req, res, p) {
+  let rel;
+  try { rel = decodeURIComponent(p.slice('/static/'.length)); }
+  catch (e) {
+    res.statusCode = 400;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Bad Request');
+    return;
+  }
+  const full = path.normalize(path.join(PUBLIC_DIR, rel));
+  const ext = path.extname(full).toLowerCase();
+  if ((full !== PUBLIC_DIR && !full.startsWith(PUBLIC_DIR + path.sep)) || !STATIC_MIME[ext]) {
+    res.statusCode = 403;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Forbidden');
+    return;
+  }
+  let real;
+  try { real = fs.realpathSync(full); }
+  catch (e) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Not Found');
+    return;
+  }
+  if (real !== PUBLIC_REAL && !real.startsWith(PUBLIC_REAL + path.sep)) {
+    res.statusCode = 403;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Forbidden');
+    return;
+  }
+  let buf;
+  try { buf = fs.readFileSync(full); }
+  catch (e) {
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.end('Not Found');
+    return;
+  }
+  res.statusCode = 200;
+  res.setHeader('Content-Type', STATIC_MIME[ext]);
+  res.setHeader('Content-Length', buf.length);
+  if (ext === '.xlsx') {
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(path.basename(full))}"`);
+  }
+  res.end(req.method === 'HEAD' ? undefined : buf);
+}
+
+// ============================================================
 // HTTP 服务
 // ============================================================
 const server = http.createServer((req, res) => {
@@ -959,6 +1026,9 @@ const server = http.createServer((req, res) => {
       apiTranscodeStatus(req, res, url);
     } else if (p === '/api/probe') {
       apiProbe(req, res, url);
+    } else if (p.startsWith('/static/')) {
+      // public/ 下的通用静态资源（如 /static/maths/index.html）
+      serveStatic(req, res, p);
     } else if (p.startsWith('/pdfjs/')) {
       // PDF.js 查看器静态资源（public/pdfjs/）
       servePdfjs(req, res, p);

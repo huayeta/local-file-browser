@@ -28,6 +28,7 @@
 | `GET /api/transcode-cancel` | 取消转码（kill ffmpeg 进程 + 清理 .part） |
 | `GET /api/transcode-status` | 查询转码状态（none/transcoding/done） |
 | `GET /pdfjs/*` | PDF.js 查看器静态资源 |
+| `GET /static/*` | `public/` 下的通用静态资源（白名单扩展名） |
 
 ---
 
@@ -293,6 +294,16 @@ PDF.js 查看器静态资源（`public/pdfjs/` 目录，如 `pdf.min.mjs`、`pdf
 - `progress` 转码进度百分比（0-100）：`transcoding` 时返回当前进度（实时递增），`done` 返回 `100`，`none` 返回 `0`
 
 **错误**：`400`（无效 root/路径越界）
+
+---
+
+## 11. `GET /static/<相对路径>`
+
+提供项目 `public/` 目录下的通用静态资源（如 `/static/maths/index.html`）。路径需 URL 编码；仅允许白名单扩展名：`.html`、`.htm`、`.css`、`.js`、`.mjs`、`.svg`、`.png`、`.ico`、`.xlsx`。带 realpath 越界校验，防止访问根目录外的文件；`.xlsx` 以 `attachment` 下载。
+
+**响应**：`200 OK` + 对应 `Content-Type` + `Content-Length`（`HEAD` 只返回响应头）
+
+**错误**：`400`（路径解码失败）、`403`（越界或扩展名不在白名单）、`404`（文件不存在）
 
 ---
 
