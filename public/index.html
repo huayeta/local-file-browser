@@ -322,6 +322,28 @@
   #pdf-overlay.show { display: flex; }
   #pdf-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   #pdf-title { font-size: 13px; color: var(--text); flex: 1; word-break: break-all; }
+  /* DOCX 预览浮层（docx-preview 懒加载） */
+  #docx-overlay {
+    position: fixed; left: 0; right: 0; bottom: 0; top: 0; z-index: 100;
+    background: rgba(10, 14, 24, .97);
+    padding: 12px 16px 16px; display: none; flex-direction: column;
+  }
+  #docx-overlay.show { display: flex; }
+  #docx-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  #docx-title { font-size: 13px; color: var(--text); flex: 1; word-break: break-all; }
+  #docx-close, #docx-download {
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 3px 10px;
+    cursor: pointer; font-size: 12px; text-decoration: none;
+    display: inline-block; white-space: nowrap;
+  }
+  #docx-close:hover, #docx-download:hover { color: #fff; border-color: var(--accent); }
+  #docx-body {
+    flex: 1; overflow: auto; background: #f0f2f5; border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; position: relative;
+  }
+  #docx-body .docx-wrapper { background: transparent; padding: 0; }
+  #docx-loading { color: #444; font-size: 14px; padding: 20px; }
   #pdf-close, #pdf-open-new {
     background: var(--panel2); border: 1px solid var(--border);
     color: var(--muted); border-radius: 6px; padding: 3px 10px;
@@ -460,6 +482,19 @@
   </div>
   <ul id="file-list"></ul>
 </main>
+
+<!-- DOCX 预览浮层 -->
+<div id="docx-overlay">
+  <div id="docx-head">
+    <span id="docx-title"></span>
+    <a id="docx-download" href="#" target="_blank" rel="noopener noreferrer">⬇ 下载</a>
+    <button id="docx-close">✕ 关闭</button>
+  </div>
+  <div id="docx-body">
+    <div id="docx-style"></div>
+    <div id="docx-content"><div id="docx-loading">📄 正在渲染 Word 文档…</div></div>
+  </div>
+</div>
 
 <!-- 播放器浮层 -->
 <div id="player-overlay">
@@ -977,6 +1012,8 @@ function handleClick(e) {
     window.open(fileUrl(e), '_blank'); // 图片新标签页查看
   } else if (e.kind === 'text') {
     openTextPreview(e);
+  } else if (/\.docx$/i.test(e.name)) {
+    openDocxPreview(e);  // Word 文档：docx-preview 懒加载渲染
   } else {
     // 其他文件 → 下载
     const a = document.createElement('a');
@@ -1983,6 +2020,81 @@ function applyUrlState() {
 }
 window.addEventListener('popstate', applyUrlState);
 window.addEventListener('hashchange', applyUrlState);
+
+// ============================================================
+// DOCX 预览（docx-preview 懒加载，自托管在 /static/docxpreview/）
+//   仅在首次打开 .docx 时才注入库脚本，不影响首屏与其它类型加载
+const DOCX_PREVIEW_BASE = '/local/static/docxpreview';
+const _docxScripts = {};
+function loadScriptOnce(src) {
+  if (_docxScripts[src]) return _docxScripts[src];
+  _docxScripts[src] = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => { delete _docxScripts[src]; reject(new Error('加载脚本失败: ' + src)); };
+    document.head.appendChild(s);
+  });
+  return _docxScripts[src];
+}
+let _docxLibPromise = null;
+function loadDocxLib() {
+  if (window.docx && window.JSZip) return Promise.resolve();
+  if (!_docxLibPromise) {
+    _docxLibPromise = loadScriptOnce(DOCX_PREVIEW_BASE + '/jszip.min.js')
+      .then(() => loadScriptOnce(DOCX_PREVIEW_BASE + '/docx-preview.min.js'))
+      .catch((err) => { _docxLibPromise = null; throw err; });
+  }
+  return _docxLibPromise;
+}
+
+const docxOverlay = $('docx-overlay');
+const docxContent = $('docx-content');
+const docxStyle = $('docx-style');
+let docxLoadSeq = 0;
+
+async function openDocxPreview(e) {
+  const seq = ++docxLoadSeq;
+  $('docx-title').textContent = '📄 ' + e.name;
+  $('docx-download').href = fileUrl(e);
+  docxStyle.textContent = '';
+  docxContent.replaceChildren();
+  const loading = document.createElement('div');
+  loading.id = 'docx-loading';
+  loading.textContent = '📄 正在渲染 Word 文档…';
+  docxContent.appendChild(loading);
+  docxOverlay.classList.add('show');
+  try {
+    await loadDocxLib();
+    if (seq !== docxLoadSeq) return;          // 已被后续请求取代
+    const resp = await fetch(fileUrl(e));
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const buf = await resp.arrayBuffer();
+    if (seq !== docxLoadSeq) return;
+    docxContent.replaceChildren();
+    await window.docx.renderAsync(buf, docxContent, docxStyle, {
+      className: 'docx', inWrapper: true, breakPages: true,
+      ignoreLastRenderedPageBreak: false,
+    });
+  } catch (err) {
+    docxContent.replaceChildren();
+    const msg = document.createElement('div');
+    msg.id = 'docx-loading';
+    msg.innerHTML = '❌ 无法渲染该 Word 文档（' + escapeHtml(String((err && err.message) || err)) +
+      '）。可点右上「下载」用本机 Word 打开。';
+    docxContent.appendChild(msg);
+  }
+}
+function closeDocxPreview() {
+  docxLoadSeq++;                 // 使进行中的渲染结果失效
+  docxOverlay.classList.remove('show');
+  docxContent.replaceChildren();
+  docxStyle.textContent = '';
+}
+$('docx-close').onclick = closeDocxPreview;
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && docxOverlay.classList.contains('show')) closeDocxPreview();
+});
 
 // ============================================================
 // 启动
