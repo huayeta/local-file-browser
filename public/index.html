@@ -534,6 +534,7 @@ let roots = [];        // 配置的根目录
 let currentRoot = 0;   // 当前根目录索引
 let currentPath = '';  // 当前相对路径（根目录内）
 let entries = [];      // 当前列表
+let pendingPlayName = null;  // 待自动播放的文件名（来自 URL ?play=，进入目录后自动弹窗播放）
 let sortKey = 'name';  // 目录列表排序字段: name | size | mtime
 let sortDir = 1;       // 1=升序, -1=降序
 let cloudVodServer = '';  // 云点播服务地址（可配置，从 /api/roots 读取；播放不兼容格式时的"云点播播放"选项）
@@ -569,25 +570,36 @@ function encodeSearchState(q) {
 }
 
 function parseHash() {
-  const h = location.hash || '';
+  let h = location.hash || '';
+  // 目录状态下允许在 hash 末尾附带 ?play=<文件名>，进入目录后自动弹窗播放该视频
+  let play = null;
+  const qi = h.indexOf('?');
+  if (qi >= 0) {
+    const qs = h.slice(qi + 1);
+    h = h.slice(0, qi);
+    try {
+      const params = new URLSearchParams(qs);
+      if (params.has('play')) play = params.get('play');
+    } catch (e) { /* 忽略非法 query */ }
+  }
   // 搜索状态：#s/root/q
   const sm = /^#s\/(\d+)\/(.*)$/.exec(h);
   if (sm) {
     let q = '';
     try { q = decodeURIComponent(sm[2]); } catch (e) { /* 解码失败则空词 */ }
-    return { search: true, root: parseInt(sm[1], 10) || 0, q };
+    return { search: true, root: parseInt(sm[1], 10) || 0, q, play };
   }
   // 目录状态：#/root/path
   const m = /^#\/(\d+)(?:\/(.*))?$/.exec(h);
-  if (!m) return { search: false, root: 0, path: '' };
+  if (!m) return { search: false, root: 0, path: '', play };
   const root = parseInt(m[1], 10);
   let path = '';
   if (m[2] !== undefined) {
     try {
       path = '/' + m[2].split('/').map(decodeURIComponent).join('/');
-    } catch (e) { return { search: false, root: 0, path: '' }; }
+    } catch (e) { return { search: false, root: 0, path: '', play }; }
   }
-  return { search: false, root, path };
+  return { search: false, root, path, play };
 }
 
 // 导航成功后把状态写入 URL（pushState 产生历史记录，支持后退）
@@ -694,6 +706,11 @@ async function loadRoots() {
       loadList();
     } else {
       currentPath = st.path || '';
+      if (st.play) {
+        // 带 ?play=：记录待播放文件，并把 URL 规范化（去掉 query，replace 不产生历史）
+        pendingPlayName = st.play;
+        try { history.replaceState(null, '', encodeState()); } catch (e) { /* ignore */ }
+      }
       loadList();
     }
   } catch (e) {
@@ -773,9 +790,25 @@ async function loadList() {
     // 加载成功：同步 URL（hash）并恢复上次滚动位置（若有）
     syncUrl();
     restoreScrollState();
+    // 若 URL 带 ?play=<文件名>，目录加载完成后自动弹窗播放
+    autoPlayPending();
   } catch (e) {
     loadingEl.style.display = 'none';
     fileListEl.innerHTML = `<li class="empty">❌ 加载失败: ${e.message}</li>`;
+  }
+}
+
+// URL ?play=<文件名>：当前目录列表就绪后，自动找到该文件并弹窗播放
+function autoPlayPending() {
+  if (!pendingPlayName) return;
+  const name = pendingPlayName;
+  pendingPlayName = null;  // 只播放一次，避免后续刷新重复弹出
+  const target = entries.find(x =>
+    x.name === name && (x.kind === 'video' || x.kind === 'audio'));
+  if (target) {
+    handleClick(target);
+  } else {
+    console.warn('[autoPlay] 当前目录未找到待播放文件：', name);
   }
 }
 
@@ -1939,9 +1972,13 @@ function applyUrlState() {
     return;
   }
 
-  // 目录状态：状态未变则跳过
-  if (!searchMode && st.path === currentPath) return;
+  // 目录状态：状态未变且无待播放请求则跳过；有 ?play= 时要在当前目录尝试播放
+  if (!searchMode && st.path === currentPath && !st.play) return;
   currentPath = st.path || '';
+  if (st.play) {
+    pendingPlayName = st.play;
+    try { history.replaceState(null, '', encodeState()); } catch (e) { /* ignore */ }
+  }
   loadList();
 }
 window.addEventListener('popstate', applyUrlState);
