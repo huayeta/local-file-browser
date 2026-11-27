@@ -344,6 +344,36 @@
   }
   #docx-body .docx-wrapper { background: transparent; padding: 0; }
   #docx-loading { color: #444; font-size: 14px; padding: 20px; }
+  /* 下载确认弹窗：文件格式不支持预览 / 预览失败时询问是否下载 */
+  #dlg-mask {
+    position: fixed; inset: 0; z-index: 200; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(6, 9, 16, .68); backdrop-filter: blur(2px);
+  }
+  #dlg-mask.show { display: flex; }
+  #dlg-box {
+    width: min(470px, calc(100vw - 36px));
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 22px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .55);
+  }
+  #dlg-title { font-size: 15px; font-weight: 600; color: #fff; margin-bottom: 10px; }
+  #dlg-msg { font-size: 13px; color: var(--muted); line-height: 1.7; word-break: break-word; }
+  #dlg-name {
+    font-size: 12px; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 12px 0 6px;
+    word-break: break-all; max-height: 84px; overflow: auto; line-height: 1.5;
+  }
+  #dlg-meta { font-size: 11px; color: var(--muted); margin-bottom: 16px; }
+  #dlg-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  #dlg-actions button {
+    border-radius: 7px; padding: 7px 16px; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel2); color: var(--muted);
+  }
+  #dlg-actions button:hover { color: #fff; border-color: var(--accent); }
+  #dlg-ok { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  #dlg-ok:hover { color: #06121f; filter: brightness(1.08); }
   #pdf-close, #pdf-open-new {
     background: var(--panel2); border: 1px solid var(--border);
     color: var(--muted); border-radius: 6px; padding: 3px 10px;
@@ -520,8 +550,23 @@
     <button id="choice-cancel">取消</button>
     <button id="choice-transcode">转换（MP4）</button>
     <button id="choice-cloud">云点播播放</button>
+    <button id="choice-download">⬇ 下载原文件</button>
   </div>
   <button id="transcode-cancel-btn" style="display:none">✕ 取消转码</button>
+</div>
+
+<!-- 下载确认弹窗：无法预览的文件询问是否下载 -->
+<div id="dlg-mask">
+  <div id="dlg-box" role="dialog" aria-modal="true" aria-labelledby="dlg-title">
+    <div id="dlg-title">无法在线预览</div>
+    <div id="dlg-msg"></div>
+    <div id="dlg-name"></div>
+    <div id="dlg-meta"></div>
+    <div id="dlg-actions">
+      <button id="dlg-cancel" type="button">取消</button>
+      <button id="dlg-ok" type="button">⬇ 下载</button>
+    </div>
+  </div>
 </div>
 
 <!-- 文本预览浮层 -->
@@ -1015,15 +1060,59 @@ function handleClick(e) {
   } else if (/\.docx$/i.test(e.name)) {
     openDocxPreview(e);  // Word 文档：docx-preview 懒加载渲染
   } else {
-    // 其他文件 → 下载
-    const a = document.createElement('a');
-    a.href = fileUrl(e);
-    a.download = e.name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    // 其他文件（zip/rar/pptx/xlsx/exe 等浏览器无法预览的格式）→ 弹窗询问是否下载
+    promptDownload(e, '该文件格式不支持在浏览器中在线预览，需要下载到本机后用相应软件打开。');
   }
 }
+
+// ============================================================
+// 下载确认弹窗：文件无法在线预览（格式不支持 / 预览失败）时，询问是否下载
+// ============================================================
+const dlgMask = $('dlg-mask');
+let dlgTarget = null;
+
+// 触发浏览器下载（Content-Disposition: attachment + a[download]）
+function downloadFile(e) {
+  if (!e) return;
+  const a = document.createElement('a');
+  a.href = fileUrl(e);
+  a.download = e.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+// reason: 说明为什么不能预览（展示给用户）
+function promptDownload(e, reason) {
+  if (!e) return;
+  dlgTarget = e;
+  $('dlg-msg').textContent = reason || '该文件格式不支持在浏览器中在线预览。';
+  $('dlg-name').textContent = e.name;
+  const ext = (String(e.name).split('.').pop() || '').toUpperCase();
+  const meta = [ext, formatSize(e.size)].filter(Boolean).join(' · ');
+  $('dlg-meta').textContent = (meta ? meta + '　·　' : '') + '是否下载到本机？';
+  dlgMask.classList.add('show');
+  $('dlg-ok').focus();
+}
+
+function closeDownloadDialog() {
+  dlgMask.classList.remove('show');
+  dlgTarget = null;
+}
+
+$('dlg-cancel').onclick = closeDownloadDialog;
+$('dlg-ok').onclick = () => {
+  const t = dlgTarget;
+  closeDownloadDialog();
+  downloadFile(t);
+};
+dlgMask.addEventListener('click', (ev) => { if (ev.target === dlgMask) closeDownloadDialog(); });
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && dlgMask.classList.contains('show')) {
+    ev.stopPropagation();
+    closeDownloadDialog();
+  }
+});
 
 // ============================================================
 // 已访问标记（localStorage）：记录点击过的文件，列表里以淡紫色显示
@@ -1489,6 +1578,14 @@ $('choice-cloud').onclick = () => {
   const e = pendingChoice; pendingChoice = null;
   if (e) playWithCloudVod(e);
 };
+// 下载原文件（浏览器播不了时，用户可拿本机播放器看）
+$('choice-download').onclick = () => {
+  $('choice-bar').style.display = 'none';
+  const e = pendingChoice; pendingChoice = null;
+  if (!e) return;
+  $('player-hint').textContent = '⬇ 正在下载原文件…';
+  downloadFile(e);
+};
 
 // 本地转码为 MP4：启动转码并轮询（失败/取消均有明确提示）
 async function startLocalTranscode(e) {
@@ -1780,13 +1877,8 @@ function decodeTextBytes(buf) {
 
 async function openTextPreview(e) {
   if (e.size > TEXT_PREVIEW_MAX) {
-    alert('文件较大（' + formatSize(e.size) + '），已为你下载。');
-    const a = document.createElement('a');
-    a.href = fileUrl(e);
-    a.download = e.name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    // 文件过大不在线预览 → 询问是否下载（不再静默下载）
+    promptDownload(e, '文件较大（' + formatSize(e.size) + '），为避免卡顿不在此处在线预览。');
     return;
   }
   $('text-title').textContent = '📝 ' + e.name;
@@ -1896,7 +1988,11 @@ async function openPdfPreview(e) {
     pdfCanvas.style.display = 'block';
   } catch (err) {
     pdfLoadingEl.style.display = 'none';
-    $('pdf-hint').textContent = '❌ PDF 加载失败: ' + (err.message || err);
+    // 无法在线解析 → 询问是否下载（不再只留一句失败提示）
+    $('pdf-hint').innerHTML = '❌ PDF 加载失败: ' + escapeHtml(String(err.message || err)) +
+      '　<a href="#" id="pdf-err-download">点此下载原文件</a>';
+    const dl = document.getElementById('pdf-err-download');
+    if (dl) dl.onclick = (ev) => { ev.preventDefault(); promptDownload(e, '该 PDF 无法在线解析（可能已损坏或格式特殊）。'); };
   }
 }
 
@@ -2119,8 +2215,10 @@ async function openDocxPreview(e) {
     const msg = document.createElement('div');
     msg.id = 'docx-loading';
     msg.innerHTML = '❌ 无法渲染该 Word 文档（' + escapeHtml(String((err && err.message) || err)) +
-      '）。可点右上「下载」用本机 Word 打开。';
+      '）。可点右上「下载」用本机 Word 打开，或 <a href="#" id="docx-err-download">点此下载</a>。';
     docxContent.appendChild(msg);
+    const dl = document.getElementById('docx-err-download');
+    if (dl) dl.onclick = (ev) => { ev.preventDefault(); promptDownload(e, '该 Word 文档无法在线渲染（可能包含不兼容的图片/图表）。'); };
   }
 }
 function closeDocxPreview() {
