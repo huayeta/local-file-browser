@@ -382,57 +382,124 @@ function matchScore(normName, keywords) {
   return score;
 }
 
-// 递归搜索；ctx: { rootFull, keywords, cancelled, timedOut, results }
-async function searchWalk(ctx, absDir, relDir, depth) {
-  // 遍历只受取消/超时/深度限制，不因结果数量提前终止——
-  // 否则结果多的目录会截断遍历，导致其后目录里的文件/文件夹搜不到
-  if (ctx.cancelled || ctx.timedOut) return;
-  // 深度上限动态读取：config.json 的 searchMaxDepth 热重载后立即生效
-  if (depth > (CONFIG.searchMaxDepth || 8)) return;
+// 递归遍历（并发池 + 异步 stat + 逐条回调）
+//   ctx: { rootFull, keywords, cancelled, timedOut, maxDepth, maxResults,
+//          results, matched, overflow }
+//   onMatch(item)：每命中一条就回调一次（用于流式下发）
+async function searchWalk(ctx, onMatch) {
+  const CONCURRENCY = 6;   // 并发读目录：网络盘上串行会把每次 readdir 的延迟累加
+  const queue = [{ abs: ctx.rootFull, rel: '', depth: 0 }];
+  let running = 0;
 
-  let dirents;
-  try {
-    dirents = await fs.promises.readdir(absDir, { withFileTypes: true });
-  } catch (e) { return; } // 目录不可读则跳过
-
-  for (const ent of dirents) {
+  const processDir = async (job) => {
     if (ctx.cancelled || ctx.timedOut) return;
-    const name = ent.name;
-    // 跳过隐藏项（.开头、.DS_Store、回收站等）
-    if (name.startsWith('.') || name === '$RECYCLE.BIN') continue;
-    // 符号链接不进入：防环、防越界、防重复遍历
-    if (ent.isSymbolicLink()) continue;
+    let dirents;
+    try {
+      dirents = await fs.promises.readdir(job.abs, { withFileTypes: true });
+    } catch (e) { return; }   // 目录不可读则跳过
+    for (const ent of dirents) {
+      if (ctx.cancelled || ctx.timedOut) return;
+      const name = ent.name;
+      // 跳过隐藏项（.开头、.DS_Store、回收站等）
+      if (name.startsWith('.') || name === '$RECYCLE.BIN') continue;
+      // 符号链接不进入：防环、防越界、防重复遍历
+      if (ent.isSymbolicLink()) continue;
 
-    const isDir = ent.isDirectory();
-    const childRel = relDir ? relDir + '/' + name : name;
-    const normName = normalizeText(name);
-    const score = matchScore(normName, ctx.keywords);
+      const isDir = ent.isDirectory();
+      const childRel = job.rel ? job.rel + '/' + name : name;
+      const score = matchScore(normalizeText(name), ctx.keywords);
 
-    if (score > 0) {
-      const childFull = path.join(absDir, name);
-      let size = 0, mtime = null;
-      try {
-        const s = fs.statSync(childFull);
-        size = isDir ? 0 : s.size;
-        mtime = s.mtime;
-      } catch (e) { /* ignore */ }
-      ctx.results.push({
-        name,
-        isDir,
-        kind: isDir ? 'dir' : classify(name),
-        size,
-        mtime: mtime ? mtime.toISOString() : null,
-        path: '/' + childRel,
-        score,
-      });
+      if (score > 0) {
+        const childFull = path.join(job.abs, name);
+        let size = 0, mtime = null;
+        try {
+          // 异步 stat：同步版会把事件循环卡住（命中多时整个服务失去响应）
+          const st = await fs.promises.stat(childFull);
+          size = isDir ? 0 : st.size;
+          mtime = st.mtime;
+        } catch (e) { /* ignore */ }
+        ctx.matched++;
+        if (ctx.results.length < ctx.maxResults) {
+          const item = {
+            name,
+            isDir,
+            kind: isDir ? 'dir' : classify(name),
+            size,
+            mtime: mtime ? mtime.toISOString() : null,
+            path: '/' + childRel,
+            score,
+          };
+          ctx.results.push(item);
+          if (onMatch) onMatch(item);
+        } else {
+          ctx.overflow = true;   // 已到上限：继续遍历只为统计命中数/判断截断
+        }
+      }
+
+      if (isDir && job.depth + 1 <= ctx.maxDepth) {
+        queue.push({ abs: path.join(job.abs, name), rel: childRel, depth: job.depth + 1 });
+      }
     }
+  };
 
-    if (isDir) {
-      await searchWalk(ctx, path.join(absDir, name), childRel, depth + 1);
-    }
-  }
+  await new Promise((resolve) => {
+    const pump = () => {
+      if (ctx.cancelled || ctx.timedOut) {
+        if (running === 0) resolve();
+        return;   // 否则等运行中的任务结束后再收尾
+      }
+      while (running < CONCURRENCY && queue.length > 0) {
+        const job = queue.shift();
+        running++;
+        processDir(job).then(
+          () => { running--; pump(); },
+          () => { running--; pump(); },
+        );
+      }
+      if (running === 0 && queue.length === 0) resolve();
+    };
+    pump();
+  });
 }
 
+// 排序：文件夹优先 → 匹配度 → 路径
+function sortSearchResults(list) {
+  return list.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    if (b.score !== a.score) return b.score - a.score;
+    return a.path.localeCompare(b.path, 'zh-CN');
+  });
+}
+
+// 搜索公共部分：校验参数 → 建 ctx → 起超时 → 遍历
+//   返回 { ctx, timeoutMs, timer } 或 null（已写错误响应）
+function prepareSearch(rootIndex, root, q, res) {
+  const resolved = resolveWithinRoot(root, '');
+  if (!resolved.ok) { sendJson(res, resolved.status, { error: resolved.error }); return null; }
+
+  const ctx = {
+    rootFull: resolved.full,
+    keywords: q.split(/\s+/).filter(Boolean).map(normalizeText),
+    cancelled: false,
+    timedOut: false,
+    // 深度/上限/超时都动态读取，config.json 热重载后立即生效
+    maxDepth: CONFIG.searchMaxDepth || 6,
+    maxResults: CONFIG.searchMaxResults || 200,
+    results: [],
+    matched: 0,
+    overflow: false,
+  };
+
+  // 客户端断开（换关键词/关页面/刷新）→ 立刻停止遍历
+  // 关键：必须写 ctx.cancelled，searchWalk 只认这个标志
+  res.on('close', () => { ctx.cancelled = true; });
+
+  const timeoutMs = CONFIG.searchTimeoutMs || 10000;
+  const timer = setTimeout(() => { ctx.timedOut = true; }, timeoutMs);
+  return { ctx, timeoutMs, timer };
+}
+
+// API: /api/search?root=<i>&q=<关键词> — 一次性返回 JSON（保留兼容/脚本调用）
 function apiSearch(req, res, url) {
   const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
   const root = CONFIG.roots[rootIndex];
@@ -440,57 +507,113 @@ function apiSearch(req, res, url) {
 
   const q = (url.searchParams.get('q') || '').trim();
   if (!q) {
-    return sendJson(res, 200, { query: '', root: { index: rootIndex, name: root.name }, total: 0, truncated: false, results: [] });
+    return sendJson(res, 200, { query: '', root: { index: rootIndex, name: root.name }, total: 0, matched: 0, truncated: false, results: [] });
   }
 
-  const resolved = resolveWithinRoot(root, '');
-  if (!resolved.ok) return sendJson(res, resolved.status, { error: resolved.error });
+  const prep = prepareSearch(rootIndex, root, q, res);
+  if (!prep) return;
+  const { ctx, timer } = prep;
 
-  // 客户端取消感知：刷新/换关键词/关页面 → 请求断开 → 停止遍历
-  let cancelled = false;
-  res.on('close', () => { cancelled = true; });
-
-  const ctx = {
-    rootFull: resolved.full,
-    keywords: q.split(/\s+/).filter(Boolean).map(normalizeText),
-    cancelled: false,
-    timedOut: false,
-    results: [],
-  };
-
-  // 超时动态读取：config.json 的 searchTimeoutMs 热重载后立即生效（不固化在模块顶层）
-  const timeoutMs = CONFIG.searchTimeoutMs || 10000;
-  const timer = setTimeout(() => { ctx.timedOut = true; }, timeoutMs);
-
-  (async () => {
-    await searchWalk(ctx, ctx.rootFull, '', 0);
+  searchWalk(ctx, null).then(() => {
     clearTimeout(timer);
-    if (cancelled) return; // 客户端已断开，不再写响应
+    if (ctx.cancelled) return;   // 客户端已断开，不再写响应
 
-    ctx.results.sort((a, b) => {
-      // 文件夹优先，其次匹配度，再按路径
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      if (b.score !== a.score) return b.score - a.score;
-      return a.path.localeCompare(b.path, 'zh-CN');
-    });
-
-    // 结果上限动态读取：config.json 的 searchMaxResults 热重载后立即生效
-    const maxResults = CONFIG.searchMaxResults || 200;
-    // 遍历已完整执行：仅当超时或结果确实超过上限时才标记截断
-    const truncated = ctx.timedOut || ctx.results.length > maxResults;
-    const results = ctx.results.slice(0, maxResults).map(({ score, ...rest }) => rest);
-
+    sortSearchResults(ctx.results);
+    // truncated：超时 / 命中数确实超过上限
+    const truncated = ctx.timedOut || ctx.overflow;
+    const results = ctx.results.map(({ score, ...rest }) => rest);
     sendJson(res, 200, {
       query: q,
       root: { index: rootIndex, name: root.name, path: root.path },
       total: results.length,
+      matched: ctx.matched,      // 真实命中总数（可能大于 total）
       truncated,
       results,
     });
-  })().catch(err => {
+  }).catch(err => {
     clearTimeout(timer);
     console.error('搜索错误:', err.message);
-    if (!cancelled) sendJson(res, 500, { error: '搜索失败' });
+    if (!ctx.cancelled) sendJson(res, 500, { error: '搜索失败' });
+  });
+}
+
+// API: /api/search-stream?root=<i>&q=<关键词> — NDJSON 流式搜索
+//   边遍历边下发：{"type":"batch","results":[...]} … {"type":"done",...}
+//   首屏几百毫秒就能看到结果，不用等整棵目录树遍历完
+function apiSearchStream(req, res, url) {
+  const rootIndex = parseInt(url.searchParams.get('root') || '0', 10);
+  const root = CONFIG.roots[rootIndex];
+  if (!root) return sendJson(res, 400, { error: `无效的 root 索引: ${rootIndex}` });
+
+  const q = (url.searchParams.get('q') || '').trim();
+  if (!q) {
+    return sendJson(res, 200, { query: '', total: 0, matched: 0, truncated: false, results: [] });
+  }
+
+  const prep = prepareSearch(rootIndex, root, q, res);
+  if (!prep) return;
+  const { ctx, timer } = prep;
+
+  res.writeHead(200, {
+    'Content-Type': 'application/x-ndjson; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',   // 关掉 nginx 等代理的缓冲，否则流式失效
+  });
+
+  let ended = false;
+  const send = (obj) => {
+    if (ended || ctx.cancelled) return;
+    try { res.write(JSON.stringify(obj) + '\n'); } catch (e) { ended = true; }
+  };
+
+  // 批量下发：攒够 20 条或静默 150ms 就 flush，避免每条一次 write
+  let buffer = [];
+  let flushTimer = null;
+  const flush = () => {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (!buffer.length) return;
+    send({ type: 'batch', results: buffer });
+    buffer = [];
+  };
+  const onMatch = (item) => {
+    buffer.push(item);
+    if (buffer.length >= 20) flush();
+    else if (!flushTimer) flushTimer = setTimeout(flush, 150);
+  };
+
+  const startedAt = Date.now();
+  searchWalk(ctx, onMatch).then(() => {
+    clearTimeout(timer);
+    flush();
+    // 诊断日志：只记录"被取消"或"耗时超过 1 秒"的搜索，避免刷屏
+    const elapsed = Date.now() - startedAt;
+    if (ctx.cancelled || elapsed > 1000) {
+      console.log(`🔍 搜索「${q}」${ctx.cancelled ? '已取消' : '完成'}：`
+        + `扫描命中 ${ctx.matched} 条，用时 ${(elapsed / 1000).toFixed(1)}s`
+        + `${ctx.timedOut ? '（超时中断）' : ''}`);
+    }
+    if (ctx.cancelled) { ended = true; try { res.end(); } catch (e) {} return; }
+    sortSearchResults(ctx.results);
+    send({
+      type: 'done',
+      query: q,
+      root: { index: rootIndex, name: root.name, path: root.path },
+      total: ctx.results.length,
+      matched: ctx.matched,
+      truncated: ctx.timedOut || ctx.overflow,
+      timedOut: ctx.timedOut,
+      // 最终顺序（前端据此重排，避免流式到达顺序导致列表跳动）
+      order: ctx.results.map((r) => r.path),
+    });
+    ended = true;
+    try { res.end(); } catch (e) {}
+  }).catch(err => {
+    clearTimeout(timer);
+    console.error('搜索错误:', err.message);
+    flush();
+    send({ type: 'error', error: '搜索失败: ' + err.message });
+    ended = true;
+    try { res.end(); } catch (e) {}
   });
 }
 
@@ -1317,6 +1440,8 @@ const server = http.createServer((req, res) => {
       apiList(req, res, url);
     } else if (p === '/api/search') {
       apiSearch(req, res, url);
+    } else if (p === '/api/search-stream') {
+      apiSearchStream(req, res, url);
     } else if (p === '/file') {
       serveFile(req, res, url);
     } else if (p === '/api/transcode') {

@@ -495,6 +495,7 @@
       <option value="pdf">PDF</option>
       <option value="image">图片</option>
       <option value="text">文本</option>
+      <option value="file">其他/文档</option>
       <option value="dir">文件夹</option>
     </select>
     <button id="search-clear" title="清除搜索">✕</button>
@@ -1151,6 +1152,9 @@ let searchMode = false;       // 是否处于搜索结果视图
 let searchResults = [];       // 当前搜索结果
 let searchTimer = null;       // 防抖定时器
 let searchTruncated = false;  // 搜索是否被截断（超时/结果过多），用于区分"超时"与"无结果"
+let searchMatched = 0;        // 服务端真实命中总数（可能大于实际下发的条数）
+let searchTimedOut = false;   // 是否因超时中断遍历
+let searchStreaming = false;  // 是否正在流式接收（用于避免"未找到"闪烁）
 
 // 搜索结果内存缓存：返回搜索页时直接出结果，不重复请求后台
 //   key = `${当前根目录}:${关键词}`（搜索结果与根目录强相关）
@@ -1254,7 +1258,7 @@ function renderSearchHistory() {
 renderSearchHistory();
 
 async function doSearch(q) {
-  if (searchController) searchController.abort();  // 取消上一个请求
+  if (searchController) searchController.abort();  // 取消上一个请求（服务端也会随之停止遍历）
   const controller = new AbortController();
   searchController = controller;
   const seq = ++searchSeq;
@@ -1266,57 +1270,144 @@ async function doSearch(q) {
   if (cached) {
     if (seq !== searchSeq) return;
     searchResults = cached.results || [];
+    searchMatched = cached.matched != null ? cached.matched : searchResults.length;
+    searchTimedOut = !!cached.timedOut;
     searchTruncated = !!cached.truncated;
+    searchStreaming = false;
     renderSearchResults();
-    restoreSearchScroll(q);  // 返回搜索页时还原之前保存的滚动位置
-    syncSearchUrl(q);        // 同步 URL（已是同状态则不再入栈）
+    restoreSearchScroll(q);
+    syncSearchUrl(q);
     return;
   }
 
+  searchResults = [];
+  searchMatched = 0;
+  searchTruncated = false;
+  searchTimedOut = false;
+  searchStreaming = true;
   loadingEl.style.display = 'block';
   listHeadEl.style.display = 'none';   // 进入搜索：隐藏目录表头
   fileListEl.innerHTML = '';
   breadcrumbEl.innerHTML = '';
+
+  let firstBatchDone = false;
+  // 渐进渲染节流：一批一批到达时不必每批都重排 DOM
+  let renderPending = false;
+  const scheduleRender = () => {
+    if (renderPending) return;
+    renderPending = true;
+    requestAnimationFrame(() => { renderPending = false; if (seq === searchSeq) renderSearchResults(); });
+  };
+
   try {
     const qs = new URLSearchParams({ root: currentRoot, q });
-    const res = await fetch('/local/api/search?' + qs.toString(), { signal: controller.signal });
-    if (seq !== searchSeq) return;  // 已有更新的请求，丢弃本次结果
-    const data = await res.json();
-    if (seq !== searchSeq) return;
-    searchResults = data.results || [];
-    searchTruncated = !!data.truncated;
-    setSearchCache(q, { results: searchResults, total: data.total, truncated: data.truncated });
-    if (searchResults.length > 0) saveSearchHistory(q);  // 有结果才记历史
-    renderSearchResults();
-    restoreSearchScroll(q);  // 返回搜索页时还原之前保存的滚动位置
-    // 搜索状态写入 URL：返回/前进可回到搜索页；若 URL 已是同状态则不再入栈
-    syncSearchUrl(q);
+    const res = await fetch('/local/api/search-stream?' + qs.toString(), { signal: controller.signal });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      if (seq !== searchSeq) { try { reader.cancel(); } catch (e) {} return; }
+      buf += decoder.decode(chunk.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch (e) { continue; }
+
+        if (msg.type === 'batch') {
+          for (const it of msg.results || []) searchResults.push(it);
+          if (!firstBatchDone && searchResults.length > 0) {
+            firstBatchDone = true;
+            loadingEl.style.display = 'none';   // 首批到达就撤掉"加载中"，边搜边看
+            searchStreaming = false;
+          }
+          scheduleRender();
+        } else if (msg.type === 'done') {
+          searchMatched = msg.matched || searchResults.length;
+          searchTimedOut = !!msg.timedOut;
+          searchTruncated = !!msg.truncated;
+          // 按服务端最终排序重排（流式到达顺序会让顺序看起来跳动）
+          if (Array.isArray(msg.order) && msg.order.length === searchResults.length) {
+            const byPath = new Map(searchResults.map((r) => [r.path, r]));
+            const sorted = msg.order.map((pth) => byPath.get(pth)).filter(Boolean);
+            if (sorted.length === searchResults.length) searchResults = sorted;
+          }
+          searchStreaming = false;
+          loadingEl.style.display = 'none';
+          renderSearchResults();
+          setSearchCache(q, {
+            results: searchResults, matched: searchMatched,
+            truncated: searchTruncated, timedOut: searchTimedOut,
+          });
+          if (searchResults.length > 0) saveSearchHistory(q);
+          restoreSearchScroll(q);
+          syncSearchUrl(q);
+        } else if (msg.type === 'error') {
+          throw new Error(msg.error || '搜索失败');
+        }
+      }
+    }
+    // 流意外结束（没有 done 帧）：兜底渲染一次，别停在"加载中"
+    if (seq === searchSeq && searchStreaming) {
+      searchStreaming = false;
+      loadingEl.style.display = 'none';
+      renderSearchResults();
+    }
   } catch (err) {
     if (err.name === 'AbortError') return;  // 被更新的请求取消，忽略
     if (seq !== searchSeq) return;
+    searchStreaming = false;
     loadingEl.style.display = 'none';
-    fileListEl.innerHTML = `<li class="empty">❌ 搜索失败: ${err.message}</li>`;
+    fileListEl.innerHTML = `<li class="empty">❌ 搜索失败: ${escapeHtml(String(err.message || err))}</li>`;
   } finally {
     if (searchController === controller) searchController = null;
   }
 }
 
-// 高亮文件名中匹配关键词的部分（前端过滤后的结果同样高亮）
+// 高亮文件名中匹配关键词的部分（类型筛选后的结果同样高亮）
+// 关键：必须在"原文"上切分，再对每段单独转义，最后插入 <mark>。
+// 若先 escapeHtml 再替换，会命中 &amp; / &lt; 等实体的内部（如关键词 amp），把实体切坏。
 function highlightMatch(name) {
   const words = (searchInput.value || '').trim().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return escapeHtml(name);
-  let html = escapeHtml(name);
-  for (const w of words) {
-    // 大小写不敏感高亮；用占位避免替换后再次匹配到已插入的标签
-    const re = new RegExp(escapeRegExp(w), 'gi');
-    html = html.replace(re, m => `\u0000${m}\u0001`);
+  const text = String(name);
+  if (words.length === 0) return escapeHtml(text);
+  // 长词优先，避免短词先把长词切碎导致高亮碎片化
+  const sorted = [...words].sort((a, b) => b.length - a.length);
+  const re = new RegExp('(' + sorted.map(escapeRegExp).join('|') + ')', 'gi');
+  let out = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m[0].length === 0) { re.lastIndex++; continue; }   // 防御零长度匹配死循环
+    if (m.index > last) out += escapeHtml(text.slice(last, m.index));
+    out += '<mark>' + escapeHtml(m[0]) + '</mark>';
+    last = m.index + m[0].length;
   }
-  // 把占位符转成 <mark> 标签
-  return html.replace(/\u0000/g, '<mark>').replace(/\u0001/g, '</mark>');
+  out += escapeHtml(text.slice(last));
+  return out;
 }
 
 function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// 清除搜索：供"超时提示"里的链接调用，必须是全局函数（直接声明即可）
+function clearSearch() {
+  cancelSearch();
+  searchInput.value = '';
+  searchTypeSel.value = '';
+  searchMode = false;
+  searchResults = [];
+  searchMatched = 0;
+  searchTruncated = false;
+  searchTimedOut = false;
+  searchStreaming = false;
+  loadList();
 }
 
 // 缩短路径显示：去掉文件名本身，只保留所在目录最后两层，前段用 … 省略
@@ -1329,8 +1420,17 @@ function shortenPath(p) {
   return (parts.length > 2 ? '…/' : '/') + tail.join('/');
 }
 
-// 渲染搜索结果视图：类型过滤（前端过滤已返回结果）+ 高亮 + 路径
+// 类型中文名（统计条与提示用）
+const TYPE_LABELS = {
+  video: '视频', audio: '音频', pdf: 'PDF', image: '图片',
+  text: '文本', file: '其他/文档', dir: '文件夹',
+};
+
+// 渲染搜索结果视图：类型过滤（前端过滤已下发结果）+ 高亮 + 路径
 function renderSearchResults() {
+  // 流式搜索还没收到任何结果：保留"加载中"，避免先闪一句"未找到"
+  if (searchStreaming && searchResults.length === 0) return;
+
   loadingEl.style.display = 'none';
   listHeadEl.style.display = 'none';   // 搜索视图无表头（布局与目录视图不同）
   fileListEl.innerHTML = '';
@@ -1339,32 +1439,42 @@ function renderSearchResults() {
   const list = type ? searchResults.filter(r => r.kind === type) : searchResults;
 
   if (list.length === 0) {
-    // 区分"搜索超时被截断"与"真的没有匹配"：truncated 且无结果 → 提示超时
-    if (searchTruncated) {
-      fileListEl.innerHTML = `<li class="empty">⚠️ 搜索超时（目录较大或网络较慢），遍历未完成。可<a href="#" onclick="event.preventDefault();clearSearch();return false;" style="color:var(--accent)">清除搜索</a>后重试，或细化关键词</li>`;
+    if (searchTimedOut) {
+      // 区分"遍历超时"与"真的没有匹配"：超时时给一个真的能用的清除入口
+      fileListEl.innerHTML = '<li class="empty">⚠️ 搜索超时（目录较大或网络较慢），遍历未完成。'
+        + '可<a href="#" data-action="clear-search" style="color:var(--accent)">清除搜索</a>后重试，或细化关键词</li>';
+      const a = fileListEl.querySelector('[data-action="clear-search"]');
+      if (a) a.onclick = (ev) => { ev.preventDefault(); clearSearch(); };
     } else {
-      fileListEl.innerHTML = `<li class="empty">🔍 未找到匹配的文件${type ? '（类型: ' + type + '）' : ''}</li>`;
+      fileListEl.innerHTML = '<li class="empty">🔍 未找到匹配的文件'
+        + (type ? '（已筛选：' + escapeHtml(TYPE_LABELS[type] || type) + '）' : '') + '</li>';
     }
     return;
   }
 
-  // 结果统计条
+  // 结果统计条：显示真实命中数（可能大于下发的条数），并说明是否被截断
   const stat = document.createElement('li');
   stat.className = 'empty';
   stat.style.fontSize = '13px';
   stat.style.padding = '10px';
   stat.style.textAlign = 'left';
-  stat.textContent = `🔍 找到 ${searchResults.length} 个结果${type ? `（显示 ${list.length} 个 ${type}）` : ''}${searchResults.length >= 200 ? '，结果过多建议细化关键词' : ''}`;
+  const matched = searchMatched || searchResults.length;
+  let text = `🔍 找到 ${matched} 个结果`;
+  if (type) text += `（其中 ${TYPE_LABELS[type] || type} ${list.length} 个）`;
+  if (searchTimedOut) text += ' · ⚠️ 遍历超时，可能还有更多结果';
+  else if (matched > searchResults.length) text += `，仅显示前 ${searchResults.length} 个，建议细化关键词`;
+  stat.textContent = text;
   fileListEl.appendChild(stat);
 
   list.forEach(e => {
     const li = document.createElement('li');
     // 访问过的文件/目录加 .visited 类（淡紫色标识）
     li.className = 'item ' + e.kind + (isVisited(e) ? ' visited' : '');
+    // 文件夹也显示所在路径（否则搜出同名文件夹不知道在哪）
     li.innerHTML = `
       <span class="icon">${ICONS[e.kind] || '📦'}</span>
       <span class="name">${highlightMatch(e.name)}</span>
-      <span class="search-result-path" title="${escapeHtml(e.isDir ? '' : e.path)}">${escapeHtml(e.isDir ? '' : shortenPath(e.path))}</span>
+      <span class="search-result-path" title="${escapeHtml(e.path)}">${escapeHtml(shortenPath(e.path))}</span>
       <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
     `;
     li.onclick = () => {
