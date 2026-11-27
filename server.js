@@ -108,12 +108,23 @@ fs.watch(CONFIG_PATH, scheduleReload);
 // ============================================================
 // 文件类型判定
 // ============================================================
-const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv', '.mkv', '.avi', '.flv']);
-const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.opus']);
+// 说明：.ts 在本项目语境是 MPEG-TS 视频（而非 TypeScript 源码），故归入视频；
+//   .m2ts/.mts 是 AVCHD/摄像机同类传输流，.mpg/.mpeg 亦为容器常见扩展名
+const VIDEO_EXTS = new Set([
+  '.mp4', '.webm', '.mov', '.m4v', '.ogv', '.mkv', '.avi', '.flv',
+  '.ts', '.m2ts', '.mts', '.mpg', '.mpeg',
+  // 老式/摄像头来源容器：浏览器不能直接播，但应识别为视频以给出"转换"入口
+  '.wmv', '.rmvb', '.rm', '.asf', '.3gp', '.3g2', '.vob', '.f4v',
+]);
+const AUDIO_EXTS = new Set([
+  '.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.opus',
+  // .m4b 有声书、.wma/.amr 老式录音：识别为音频（播不了时前端提示下载）
+  '.m4b', '.wma', '.amr',
+]);
 const PDF_EXTS = new Set(['.pdf']);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico']);
 const TEXT_EXTS = new Set([
-  '.txt', '.md', '.markdown', '.log', '.json', '.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx',
+  '.txt', '.md', '.markdown', '.log', '.json', '.js', '.mjs', '.cjs', '.jsx', '.tsx',
   '.py', '.html', '.htm', '.css', '.xml', '.csv', '.ini', '.cfg', '.conf', '.yml', '.yaml',
   '.toml', '.sh', '.sql', '.java', '.c', '.cpp', '.h', '.hpp', '.go', '.rs', '.php', '.rb',
 ]);
@@ -139,6 +150,22 @@ const MIME = {
   '.mkv': 'video/x-matroska',
   '.avi': 'video/x-msvideo',
   '.flv': 'video/x-flv',
+  '.ts': 'video/mp2t',
+  '.m2ts': 'video/mp2t',
+  '.mts': 'video/mp2t',
+  '.mpg': 'video/mpeg',
+  '.mpeg': 'video/mpeg',
+  '.wmv': 'video/x-ms-wmv',
+  '.asf': 'video/x-ms-asf',
+  '.rmvb': 'application/vnd.rn-realmedia-vbr',
+  '.rm': 'application/vnd.rn-realmedia',
+  '.3gp': 'video/3gpp',
+  '.3g2': 'video/3gpp2',
+  '.vob': 'video/dvd',
+  '.f4v': 'video/x-f4v',
+  '.m4b': 'audio/mp4',
+  '.wma': 'audio/x-ms-wma',
+  '.amr': 'audio/amr',
   '.mp3': 'audio/mpeg',
   '.wav': 'audio/wav',
   '.ogg': 'audio/ogg',
@@ -155,7 +182,7 @@ const MIME = {
   '.log': 'text/plain; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.cjs': 'text/javascript; charset=utf-8',
-  '.ts': 'text/plain; charset=utf-8', '.jsx': 'text/plain; charset=utf-8', '.tsx': 'text/plain; charset=utf-8',
+  '.jsx': 'text/plain; charset=utf-8', '.tsx': 'text/plain; charset=utf-8',
   '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.xml': 'text/xml; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
@@ -609,6 +636,11 @@ const FFPROBE_PATH = CONFIG.ffprobePath || 'ffprobe';
 const SUPPORTED_VIDEO_CODECS = new Set(['h264', 'avc1', 'hevc', 'h265', 'vp8', 'vp9', 'av1']);
 // 浏览器原生支持的音频编码（-c copy 转封装时需一并受支持）
 const SUPPORTED_AUDIO_CODECS = new Set(['aac', 'mp3']);
+// 浏览器原生支持的音频容器（ffprobe format_name）；asf(wma)/amr/ape 等不支持
+const SUPPORTED_AUDIO_FORMATS = new Set([
+  'mp3', 'wav', 'flac', 'ogg', 'aac', 'webm', 'mov', 'mp4', 'm4a', 'm4b',
+]);
+
 // 浏览器原生支持的容器（ffprobe format_name）；flv/mkv/avi/rm 等一律不支持
 const SUPPORTED_VIDEO_FORMATS = new Set([
   'mp4', 'mov', 'm4a', 'm4v', '3gp', 'webm', 'ogg', 'ogv', 'mp3', 'wav', 'flac', 'aac',
@@ -646,8 +678,8 @@ function probeVideoDuration(full) {
 function probeVideoInfo(full) {
   return new Promise((resolve) => {
     execFile(FFPROBE_PATH,
-      ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name',
-        '-show_entries', 'format=format_name,duration', '-of', 'json', full],
+      ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,bit_rate',
+        '-show_entries', 'format=format_name,duration,bit_rate', '-of', 'json', full],
       (err, stdout) => {
         if (err) return resolve(null);
         try {
@@ -658,11 +690,15 @@ function probeVideoInfo(full) {
           const fmt = String((j.format && j.format.format_name) || '')
             .split(',')[0].trim().toLowerCase();
           const dur = parseFloat((j.format && j.format.duration) || '0');
+          const aBr = parseInt((a && a.bit_rate) || '0', 10);
+          const fBr = parseInt((j.format && j.format.bit_rate) || '0', 10);
           resolve({
             videoCodec: ((v && v.codec_name) || '').toLowerCase() || null,
             audioCodec: ((a && a.codec_name) || '').toLowerCase() || null,
             format: fmt || null,
             duration: Number.isFinite(dur) && dur > 0 ? dur : 0,
+            // 音频码率（bps）：用于音频转码时贴近源码率，避免产物白白变大
+            audioBitrate: Number.isFinite(aBr) && aBr > 0 ? aBr : (Number.isFinite(fBr) && fBr > 0 ? fBr : 0),
           });
         } catch (e) { resolve(null); }
       });
@@ -698,16 +734,23 @@ async function videoNeedsTranscode(full) {
 //   这类文件如果只做 -c:v copy（原样复制坏帧），产物在浏览器里必然播到坏点就崩，
 //   因此复制前必须先确认流干净；不干净就退回完整重编码（解码时由 ffmpeg 做错误掩盖，产物干净）。
 // 返回 { clean, errors }；超时/无法探测时保守返回 clean=false（宁可慢也不要给出坏产物）。
-function checkStreamClean(full, timeoutMs) {
+function checkStreamClean(full, timeoutMs, job) {
   return new Promise((resolve) => {
     let out = '';
     let settled = false;
-    const finish = (clean) => { if (!settled) { settled = true; resolve(clean); } };
+    const finish = (clean) => {
+      if (settled) return;
+      settled = true;
+      if (job && job.checkProc) job.checkProc = null;
+      resolve(clean);
+    };
     let proc;
     try {
       proc = spawn(FFMPEG_PATH, ['-hide_banner', '-v', 'error', '-i', full, '-an', '-f', 'null', '-'],
         { stdio: ['ignore', 'ignore', 'pipe'] });
     } catch (e) { return finish(false); }
+    // 登记进程：取消转码时能连校验进程一起 kill（否则校验阶段取消无效）
+    if (job) job.checkProc = proc;
     const timer = setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch (e) {}
       finish(false);
@@ -731,12 +774,38 @@ function needsCleanCheck(full, mode) {
   return mode === 'audio' || /\.(ts|m2ts|mts|mpg|mpeg)$/i.test(full);
 }
 
+// 产物可用性校验（删除源文件前的最后一道闸）：
+//   1) 文件存在且体积合理   2) ffprobe 能解析、含可播放流
+//   3) 时长与源相差不超过 max(5s, 2%)——防止"转了一半"被当成成功
+// 任一条不满足都返回 false → 不删源文件。
+function outputLooksComplete(dstFull, expectDuration) {
+  return new Promise((resolve) => {
+    let st;
+    try { st = fs.statSync(dstFull); } catch (e) { return resolve(false); }
+    if (!st.size || st.size < 1024) return resolve(false);
+    probeVideoInfo(dstFull).then((info) => {
+      if (!info) return resolve(false);
+      if (!info.videoCodec && !info.audioCodec) return resolve(false);
+      if (info.duration > 0 && expectDuration > 0) {
+        const diff = Math.abs(info.duration - expectDuration);
+        const tol = Math.max(5, expectDuration * 0.02);
+        if (diff > tol) return resolve(false);
+      }
+      resolve(true);
+    });
+  });
+}
+
 // 转码产物路径：同目录同名 .mp4；若源文件本身已是 .mp4（内容可能是 FLV/TS 等），
 // 追加 .播放版 后缀——否则产物与源文件同名，会被误判"已存在产物"而永不转码
 function transcodeDstOf(srcFull) {
   const m = /^(.*?)(\.[^.\\/]+)?$/.exec(srcFull) || [];
   const base = m[1] || srcFull;
   const ext = (m[2] || '').toLowerCase();
+  // 音频源 → 转成 AAC 的 .m4a（浏览器可播）；已是 m4a/aac 则加 .播放版 避免同名
+  if (AUDIO_EXTS.has(ext)) {
+    return (ext === '.m4a' || ext === '.aac') ? base + '.播放版.m4a' : base + '.m4a';
+  }
   return ext === '.mp4' ? base + '.播放版.mp4' : base + '.mp4';
 }
 
@@ -755,15 +824,28 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
 
   // 先同步注册 job（await 之前的代码同步执行）——apiTranscode 未 await 也能立即查到 transcoding，
   // 避免前端轮询时 job 未注册而误报"转码失败"
-  const job = { proc: null, rootIndex, rel, srcFull, dstFull, dstPart, startAt: Date.now(), duration: 0, progress: 0 };
+  const job = {
+    proc: null, checkProc: null, aborted: false,
+    rootIndex, rel, srcFull, dstFull, dstPart,
+    startAt: Date.now(), duration: 0, progress: 0,
+  };
   transcodeJobs.set(jobId, job);
+
+  // 已被取消（含"校验阶段"被取消）→ 立刻收尾，不产出任何文件
+  const abortedNow = () => {
+    if (!job.aborted) return false;
+    try { if (fs.existsSync(dstPart)) fs.unlinkSync(dstPart); } catch (e) {}
+    return true;
+  };
 
   // 探测源视频（编码/容器/时长），据此选最省的模式：
   //   copy     → 只换容器（-c copy），秒级
   //   audio    → 视频无损复制 + 音频转 AAC（约 1 分钟/集，画质无损）
   //   reencode → 完整重编码（libx264 + aac）
   const info = await probeVideoInfo(srcFull);
+  if (abortedNow()) return { jobId, done: false, aborted: true };
   job.duration = (info && info.duration) || await probeVideoDuration(srcFull);
+  if (abortedNow()) return { jobId, done: false, aborted: true };
   let mode = transcodeModeOf(info);
   job.mode = mode;
   job.verifying = false;
@@ -772,8 +854,10 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
   // 有坏帧的流若原样复制，浏览器会播到坏点整片崩溃（ffmpeg/VLC 却看不出来）。
   if (needsCleanCheck(srcFull, mode)) {
     job.verifying = true;
-    const clean = await checkStreamClean(srcFull);
+    const clean = await checkStreamClean(srcFull, 300000, job);
     job.verifying = false;
+    // 校验期间用户可能已取消（校验进程也会被 kill，clean=false）→ 直接收尾
+    if (abortedNow()) return { jobId, done: false, aborted: true };
     if (!clean) {
       mode = 'reencode';
       job.mode = mode;
@@ -782,7 +866,15 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
   }
 
   job.copyMode = mode === 'copy';
-  const codecArgs = mode === 'copy'
+  const isAudioSrc = AUDIO_EXTS.has(path.extname(srcFull).toLowerCase());
+  job.isAudio = isAudioSrc;
+  // 音频目标码率贴近源（64–192k）：64k 的录音不该转成 192k 白白膨胀 3 倍
+  const srcKbps = (info && info.audioBitrate) ? Math.round(info.audioBitrate / 1000) : 0;
+  const abrKbps = srcKbps > 0 ? Math.min(192, Math.max(64, srcKbps)) : 128;
+  job.audioBitrate = abrKbps;
+  const codecArgs = isAudioSrc
+    ? ['-vn', '-c:a', 'aac', '-b:a', abrKbps + 'k']
+    : mode === 'copy'
     ? ['-c', 'copy']
     : mode === 'audio'
       ? ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2']
@@ -798,6 +890,8 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
     dstPart,
   ]);
   job.proc = proc;
+  // 极端竞态：刚 spawn 完就被取消 → 立即终止（close 回调仍会清理 .part）
+  if (job.aborted) { try { proc.kill(); } catch (e) {} }
 
   // 解析 ffmpeg stdout 进度（-progress pipe:1 输出 out_time_ms=xxx）
   let outBuf = '';
@@ -814,21 +908,42 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
     }
   });
 
-  proc.on('close', (code) => {
+  proc.on('close', async (code) => {
     // 注意：不能因 job 已被 cancel 删除就 return——取消时已 delete(jobId)，
     // 若这里跳过，close 里的 .part 清理就不执行（Windows 上残留）
     const cur = transcodeJobs.get(jobId);
     if (cur) transcodeJobs.delete(jobId);
-    if (code === 0 && fs.existsSync(dstPart)) {
-      // 转码成功：校验产物存在且非空 → rename 为正式 .mp4（原子操作）
+
+    let renamed = false;
+    if (code === 0 && !job.aborted && fs.existsSync(dstPart)) {
+      // 转码成功：产物非空 → rename 为正式文件（原子操作）
       try {
         const st = fs.statSync(dstPart);
-        if (st.size > 0) { fs.renameSync(dstPart, dstFull); }
+        if (st.size > 0) { fs.renameSync(dstPart, dstFull); renamed = true; }
         else { fs.unlinkSync(dstPart); }
       } catch (e) { try { fs.unlinkSync(dstPart); } catch (e2) {} }
     } else {
       // 失败/取消：删除 .part，源文件始终保留
       try { if (fs.existsSync(dstPart)) fs.unlinkSync(dstPart); } catch (e) {}
+    }
+
+    // 转换成功且开启"删源" → 校验产物可用后再删源文件（节省空间）
+    if (renamed && !job.aborted
+        && CONFIG.deleteSourceAfterTranscode !== false
+        && srcFull !== dstFull) {
+      const ok = await outputLooksComplete(dstFull, job.duration);
+      if (ok && fs.existsSync(srcFull)) {
+        try {
+          const srcSize = fs.statSync(srcFull).size;
+          fs.unlinkSync(srcFull);
+          job.sourceDeleted = true;
+          console.log(`🗑  转换成功，已删除源文件（省 ${(srcSize / 1048576).toFixed(1)} MB）: ${path.basename(srcFull)}`);
+        } catch (e) {
+          console.warn(`⚠️ 删除源文件失败（产物已保留）: ${path.basename(srcFull)} — ${e.message}`);
+        }
+      } else if (!ok) {
+        console.warn(`⚠️ 产物校验未通过，已保留源文件: ${path.basename(srcFull)}`);
+      }
     }
   });
 
@@ -848,11 +963,33 @@ function apiTranscode(req, res, url) {
   try { stat = fs.statSync(full); } catch (e) { return sendJson(res, 404, { error: '文件不存在' }); }
   if (stat.isDirectory()) return sendJson(res, 400, { error: '这是文件夹，不能转码' });
 
+  const dstFull = transcodeDstOf(full);
+
+  // 同一目标已在转码 → 幂等返回，不重复起任务
+  for (const job of transcodeJobs.values()) {
+    if (!job.aborted && job.dstFull === dstFull) {
+      return sendJson(res, 200, {
+        ok: true, already: true, message: '该文件已在转码中', dst: dstFull,
+      });
+    }
+  }
+  // 并发限制：同时只跑 1 个（多个 ffmpeg 会互相抢 CPU/磁盘）
+  const active = [...transcodeJobs.values()].filter((j) => !j.aborted);
+  if (active.length > 0) {
+    const a = active[0];
+    return sendJson(res, 409, {
+      error: 'busy',
+      message: '已有转码任务在进行，请先取消或等待完成',
+      activeName: path.basename(a.srcFull),
+      dst: dstFull,
+    });
+  }
+
   startTranscodeJob(rootIndex, rel, full);
   sendJson(res, 200, {
     ok: true,
     message: '转码已启动，完成前请勿重复操作',
-    dst: transcodeDstOf(full),
+    dst: dstFull,
   });
 }
 
@@ -871,7 +1008,9 @@ function apiTranscodeCancel(req, res, url) {
   let cancelled = false;
   for (const [jobId, job] of transcodeJobs) {
     if (job.dstFull === dstFull || job.dstFull === dstFull + '.part') {
-      try { job.proc.kill(); } catch (e) {}
+      job.aborted = true;                      // 让 startTranscodeJob 的后续 await 知道要收尾
+      try { if (job.checkProc) job.checkProc.kill(); } catch (e) {}   // 校验阶段的 ffmpeg
+      try { if (job.proc) job.proc.kill(); } catch (e) {}             // 转码阶段的 ffmpeg
       transcodeJobs.delete(jobId);
       cancelled = true;
     }
@@ -902,6 +1041,26 @@ function apiProbe(req, res, url) {
     if (!info) {
       // ffprobe 不可用/探测失败：前端直接播放，播放失败再提示转码
       sendJson(res, 200, { codec: null, format: null, supported: false, available: false });
+      return;
+    }
+    // 音频文件：只判音频编码 + 音频容器（mp3 的封面图会让 videoCodec=mjpeg，不能据此判死）
+    if (AUDIO_EXTS.has(path.extname(full).toLowerCase())) {
+      const aFmtOk = !info.format || SUPPORTED_AUDIO_FORMATS.has(info.format);
+      const aCodecOk = !info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec);
+      sendJson(res, 200, {
+        kind: 'audio',
+        codec: null,
+        audioCodec: info.audioCodec,
+        format: info.format,
+        duration: info.duration,
+        supported: aFmtOk && aCodecOk,
+        mode: 'reencode',           // 音频转码统一重编码为 AAC（音频很轻，很快）
+        remuxable: false,
+        // reason: audio（编码不支持，如 WMA/AMR/ALAC）/ container（容器不支持）
+        reason: !aCodecOk ? 'audio' : (!aFmtOk ? 'container' : null),
+        target: transcodeDstOf(full),
+        available: true,
+      });
       return;
     }
     const formatOk = !info.format || SUPPORTED_VIDEO_FORMATS.has(info.format);

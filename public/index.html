@@ -1050,7 +1050,7 @@ function handleClick(e) {
   }
   markVisited(e);  // 记录"已点击过"，列表渲染时以 .visited 淡紫色标识
   if (e.kind === 'video' || e.kind === 'audio') {
-    openPlayer(e);
+    openPlayer(e);   // 音视频统一进播放器：不支持的格式在播放器内给"转换/下载"选项
   } else if (e.kind === 'pdf') {
     openPdfPreview(e);  // PDF.js 浮层按需加载（大文件秒开）
   } else if (e.kind === 'image') {
@@ -1425,14 +1425,21 @@ function destroyFlvPlayer() {
 let transcodeTimer = null;
 let transcodeCancelled = false;  // 用户点击取消转码时置位
 let transcodeCurrentRel = null;  // 当前正在转码的视频相对路径（取消按钮用，避免误用 currentPath）
+let transcodeSeq = 0;            // 转码"代次"：切换文件/取消后自增，让旧的轮询结果作废
 let flvFailTarget = null;        // 当前尝试播放的视频文件（不限 .flv；播放失败 error 回调里弹转码用）
+let audioFailTarget = null;      // 当前尝试播放的音频文件（.wma/.amr 等浏览器解不了 → 弹下载）
 
 // 同目录转码产物的相对路径（如 /a.flv → /a.mp4）
 // 源文件本身已是 .mp4（真实容器可能不符，如 FLV 改名）→ 加 .播放版 后缀，避免与源文件同名
+const AUDIO_SRC_RE = /\.(mp3|wav|ogg|m4a|aac|flac|opus|m4b|wma|amr)$/i;
 function transcodeDstPath(relPath) {
   const m = /^(.*?)(\.[^./\\]+)?$/.exec(relPath) || [];
   const base = m[1] || relPath;
   const ext = (m[2] || '').toLowerCase();
+  // 音频源 → .m4a（AAC in MP4，浏览器可播）
+  if (AUDIO_SRC_RE.test(ext)) {
+    return (ext === '.m4a' || ext === '.aac') ? base + '.播放版.m4a' : base + '.m4a';
+  }
   return ext === '.mp4' ? base + '.播放版.mp4' : base + '.mp4';
 }
 
@@ -1452,19 +1459,29 @@ async function checkTranscodeStatus(rootIdx, dstPath) {
   } catch (e) { return { status: 'none', progress: 0 }; }
 }
 
-// 启动转码并轮询，完成后返回 true；被取消/失败返回 false
-function startTranscode(rootIdx, relPath, onProgress) {
+// 启动转码并轮询。返回 { ok, error }
+//   isStale(): 判定本次任务是否已过期（用户切换文件/取消）→ 立即结束、不再产生副作用
+function startTranscode(rootIdx, relPath, onProgress, isStale) {
+  const stale = () => (typeof isStale === 'function' ? isStale() : false);
   return new Promise((resolve) => {
     const qs = new URLSearchParams({ root: rootIdx, path: relPath });
     fetch('/local/api/transcode?' + qs.toString())
-      .then(r => r.json())
-      .then(() => {
+      .then(r => r.json().then(data => ({ status: r.status, data })))
+      .then(({ status, data }) => {
+        if (status === 409 || (data && data.error === 'busy')) {
+          // 服务端并发限制：已有其他任务在转
+          const busy = (data && data.message) || '已有转码任务在进行';
+          const who = data && data.activeName ? '（正在处理：' + data.activeName + '）' : '';
+          resolve({ ok: false, error: busy + who });
+          return;
+        }
         const dstPath = transcodeDstPath(relPath);
         const poll = async () => {
-          if (transcodeCancelled) { resolve(false); return; }  // 用户已取消
+          if (transcodeCancelled || stale()) { resolve({ ok: false, cancelled: true }); return; }
           const st = await checkTranscodeStatus(rootIdx, dstPath);
-          if (st.status === 'done') { resolve(true); return; }
-          if (st.status === 'none') { resolve(false); return; } // 转码失败或已取消
+          if (transcodeCancelled || stale()) { resolve({ ok: false, cancelled: true }); return; }
+          if (st.status === 'done') { resolve({ ok: true }); return; }
+          if (st.status === 'none') { resolve({ ok: false }); return; } // 失败或已取消
           if (onProgress) {
             if (st.verifying) {
               onProgress('正在校验源文件完整性…（约 1 分钟）');
@@ -1478,8 +1495,23 @@ function startTranscode(rootIdx, relPath, onProgress) {
         };
         poll();
       })
-      .catch(() => resolve(false));
+      .catch(() => resolve({ ok: false }));
   });
+}
+
+// 中止当前转码（切换文件 / 关闭播放器都调用）：kill 后台 ffmpeg（含校验进程）+ 停止轮询
+function abortActiveTranscode() {
+  if (!transcodeCurrentRel) {
+    if (transcodeTimer) { clearTimeout(transcodeTimer); transcodeTimer = null; }
+    return;
+  }
+  transcodeSeq++;                  // 让正在等待的 startLocalTranscode 变成过期
+  transcodeCancelled = true;
+  if (transcodeTimer) { clearTimeout(transcodeTimer); transcodeTimer = null; }
+  const rel = transcodeCurrentRel;
+  transcodeCurrentRel = null;
+  $('transcode-cancel-btn').style.display = 'none';
+  cancelTranscode(currentRoot, rel);
 }
 
 // 取消转码（kill 后台 ffmpeg + 清理 .part），返回是否成功取消（true/false）
@@ -1550,10 +1582,33 @@ async function playVideoWithTranscode(e) {
     const data = await res.json();
     if (data && data.available && data.supported === false) {
       // ffprobe 探测到浏览器不支持的容器/编码 → 说明原因，并按最省的转换方式给出耗时
-      const fmt = String(data.format || '').toUpperCase();
+      const fmtRaw = String(data.format || '').toLowerCase();
+      const fmt = fmtRaw.toUpperCase();
+      const ext = (String(e.name).split('.').pop() || '').toLowerCase();
+      // 该扩展名"本来就该是"的容器（用于区分"格式正常但浏览器不支持" vs "扩展名骗人"）
+      const CONTAINER_OF_EXT = {
+        mp4: ['mov', 'mp4', 'm4a', '3gp', '3g2', 'mj2'], m4v: ['mov', 'mp4'], mov: ['mov', 'mp4'],
+        flv: ['flv', 'f4v'], f4v: ['flv', 'f4v'],
+        ts: ['mpegts'], m2ts: ['mpegts'], mts: ['mpegts'],
+        mpg: ['mpeg'], mpeg: ['mpeg'], vob: ['mpeg'],
+        wmv: ['asf'], asf: ['asf'],
+        rmvb: ['rm'], rm: ['rm'],
+        mkv: ['matroska', 'webm'], webm: ['matroska', 'webm'],
+        avi: ['avi'],
+        '3gp': ['mov', 'mp4', '3gp'], '3g2': ['mov', 'mp4', '3gp'],
+      };
+      const CONTAINER_NAME = {
+        mpegts: 'MPEG-TS 传输流', rm: 'RealMedia', asf: 'ASF/WMV', flv: 'FLV',
+        matroska: 'Matroska(MKV)', avi: 'AVI', mpeg: 'MPEG-PS', f4v: 'F4V',
+      };
+      const expected = CONTAINER_OF_EXT[ext];
+      const mismatch = expected ? !expected.includes(fmtRaw) : false;
+      const fmtName = CONTAINER_NAME[fmtRaw] || (fmt || '未知');
       let why;
       if (data.reason === 'container') {
-        why = `该文件实际是 ${fmt || '非 MP4'} 容器（扩展名与内容不符），浏览器不支持该容器`;
+        why = mismatch
+          ? `该文件的真实容器是 ${fmtName}，与扩展名 .${ext} 不符，浏览器不支持该容器`
+          : `该文件是 ${fmtName} 容器，浏览器不支持直接播放`;
       } else if (data.reason === 'audio') {
         why = `该视频画面是 ${data.codec || 'H.264'}（可播），但音频是 ${String(data.audioCodec || '未知').toUpperCase()} 编码，浏览器无法解码`;
       } else {
@@ -1563,7 +1618,7 @@ async function playVideoWithTranscode(e) {
       const how = data.mode === 'copy'
         ? '可点下方「转换（MP4）」——仅换容器、不重新编码，几秒即可播。'
         : data.mode === 'audio'
-          ? '可点下方「转换（MP4）」——画面无损复制、只把音频转成 AAC，整集约 1 分钟（会先自动校验源文件是否有坏帧，如有则自动改为完整重编码，约 5 分钟）。'
+          ? '可点下方「转换（MP4）」——画面无损复制、只把音频转成 AAC，整集约 1 分钟（会先自动校验源文件是否有坏帧，如有则自动改为完整重编码，约 5～6 分钟）。'
           : '可点下方「转换（MP4）」重新编码为 H.264（耗时较长，可随时取消）。';
       $('player-hint').textContent = '⚠️ ' + why + '。' + how;
       promptChoice(e);
@@ -1578,9 +1633,54 @@ async function playVideoWithTranscode(e) {
   videoEl.play().catch(() => {});
 }
 
+// 通用探测
+async function probeMedia(e) {
+  try {
+    const qs = new URLSearchParams({ root: currentRoot, path: e.path });
+    const res = await fetch('/local/api/probe?' + qs.toString());
+    return await res.json();
+  } catch (err) { return null; }
+}
+
+// 音频播放入口：优先播已有转码产物(.m4a)；否则探测，浏览器解不了 → 提示转换
+async function playAudioWithProbe(e) {
+  const dstPath = transcodeDstPath(e.path);
+  const st = await checkTranscodeStatus(currentRoot, dstPath);
+  if (st.status === 'done') {
+    // 已有转换产物 → 直接播
+    audioEl.src = '/local/file?' + new URLSearchParams({ root: currentRoot, path: dstPath }).toString();
+    audioEl.play().catch(() => {});
+    return;
+  }
+  audioFailTarget = e;
+  const data = await probeMedia(e);
+  if (data && data.available && data.supported === false) {
+    const codec = String(data.audioCodec || '').toUpperCase();
+    const fmt = String(data.format || '').toUpperCase();
+    const why = data.reason === 'audio'
+      ? `该音频是 ${codec || '未知'} 编码，浏览器无法解码`
+      : `该文件是 ${fmt || '未知'} 容器，浏览器不支持直接播放`;
+    $('player-hint').textContent = '⚠️ ' + why +
+      '。可点下方「转换（M4A）」——只转音频、很快（通常几十秒内），转好即可在线播放。';
+    promptChoice(e);
+    return;
+  }
+  audioEl.src = fileUrl(e);
+  audioEl.play().catch(() => {});
+}
+
 // 弹"取消 / 转换 / 云点播播放"三选一（云点播服务未配置时隐藏云播按钮）
 function promptChoice(e) {
   pendingChoice = e;
+  const isAudio = !!(e && e.kind === 'audio');
+  const txt = document.querySelector('#choice-bar .choice-text');
+  if (txt) {
+    // 转换成功会删除源文件（节省空间）——必须在按钮旁明确告知
+    txt.textContent = isAudio
+      ? '该音频浏览器无法直接播放，请选择处理方式（转换成功后会删除源文件以节省空间）：'
+      : '该视频浏览器无法直接播放，请选择处理方式（转换成功后会删除源文件以节省空间）：';
+  }
+  $('choice-transcode').textContent = isAudio ? '转换（M4A）' : '转换（MP4）';
   $('choice-cloud').style.display = cloudVodServer ? '' : 'none';
   $('choice-bar').style.display = 'flex';
 }
@@ -1613,14 +1713,23 @@ $('choice-download').onclick = () => {
 async function startLocalTranscode(e) {
   const rootIdx = currentRoot;
   const dstPath = transcodeDstPath(e.path);
-  // 启动转码并轮询，显示取消按钮（可中途取消，后台同步 kill ffmpeg）
+  // 先把可能存在的上一个任务停掉（同一时间只允许一个）
+  if (transcodeCurrentRel && transcodeCurrentRel !== e.path) abortActiveTranscode();
+
+  const seq = ++transcodeSeq;      // 本次任务代次
+  const isStale = () => seq !== transcodeSeq;
   transcodeCancelled = false;
   transcodeCurrentRel = e.path;  // 记录视频文件路径（取消按钮用它，而非 currentPath）
   $('transcode-cancel-btn').style.display = 'inline-block';
-  $('player-hint').textContent = '⏳ 正在转码为 MP4…（可点击取消）';
-  const ok = await startTranscode(rootIdx, e.path, msg => { $('player-hint').textContent = '⏳ ' + msg; });
+  $('player-hint').textContent = e.kind === 'audio'
+    ? '⏳ 正在转换音频（M4A）…（可点击取消）'
+    : '⏳ 正在转码为 MP4…（可点击取消）';
+  const res = await startTranscode(rootIdx, e.path,
+    msg => { if (!isStale()) $('player-hint').textContent = '⏳ ' + msg; }, isStale);
+  // 已被取消/被别的文件取代 → 不再刷新列表、不再切换播放器（避免抢走当前视频）
+  if (isStale()) return;
   $('transcode-cancel-btn').style.display = 'none';
-  if (ok) {
+  if (res.ok) {
     $('player-hint').textContent = '✅ 转码完成，正在播放…';
     // 按当前视图刷新：搜索模式下重搜（保持搜索页，新 .mp4 也出现在结果中）；目录模式下重载列表
     const q = (searchInput.value || '').trim();
@@ -1629,9 +1738,21 @@ async function startLocalTranscode(e) {
     } else {
       await loadList();  // 刷新列表（新 .mp4 出现，源 .flv 保留）
     }
+    if (isStale()) return;
     currentIsFlv = false;
-    videoEl.src = '/local/file?' + new URLSearchParams({ root: rootIdx, path: dstPath }).toString();
-    videoEl.play().catch(() => {});
+    const srcUrl = '/local/file?' + new URLSearchParams({ root: rootIdx, path: dstPath }).toString();
+    if (/\.m4a$/i.test(dstPath)) {
+      // 音频产物：用音频元素播放（不要塞进 videoEl）
+      videoEl.style.display = 'none';
+      audioEl.style.display = 'block';
+      audioEl.src = srcUrl;
+      audioEl.play().catch(() => {});
+    } else {
+      videoEl.src = srcUrl;
+      videoEl.play().catch(() => {});
+    }
+  } else if (res.error) {
+    $('player-hint').textContent = '❌ ' + res.error;
   } else if (transcodeCancelled) {
     $('player-hint').textContent = '已取消转码，源文件未受影响。';
   } else {
@@ -1687,6 +1808,7 @@ function loadCloudSdk() {
 
 // 取消转码按钮：点击 → 通知后台 kill ffmpeg + 清理 .part，并停止前端轮询
 $('transcode-cancel-btn').onclick = async () => {
+  transcodeSeq++;                  // 作废当前轮询
   transcodeCancelled = true;
   if (transcodeTimer) { clearTimeout(transcodeTimer); transcodeTimer = null; }
   $('transcode-cancel-btn').style.display = 'none';
@@ -1717,6 +1839,8 @@ async function openPlayer(e) {
   $('cloud-player').style.display = 'none';
   $('choice-bar').style.display = 'none';
   const url = fileUrl(e);
+  // 切换文件前先停掉上一个转码任务（否则旧任务转完会抢走当前播放器并刷新列表）
+  if (transcodeCurrentRel && transcodeCurrentRel !== e.path) abortActiveTranscode();
   $('player-title').textContent = (e.kind === 'video' ? '🎬 ' : '🎵 ') + e.name;
   $('player-hint').textContent = '';
   videoEl.pause(); audioEl.pause();
@@ -1731,8 +1855,8 @@ async function openPlayer(e) {
     audioEl.style.display = 'block';
     videoEl.style.display = 'none';
     currentIsFlv = false;
-    audioEl.src = url;
-    audioEl.play().catch(() => {});
+    audioFailTarget = e;          // 播放失败时据此提示
+    playAudioWithProbe(e);        // 先探测：解不了 → 提示「转换（M4A）」/下载
   }
   overlay.classList.add('show');
   overlay.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -1745,14 +1869,10 @@ function closePlayer() {
   $('cloud-player').style.display = 'none';
   $('choice-bar').style.display = 'none';
   // 转码进行中：关闭弹窗 → 停止前端轮询 + 取消后台转码（kill ffmpeg + 清理 .part）
-  if (transcodeCurrentRel) {
-    transcodeCancelled = true;
-    if (transcodeTimer) { clearTimeout(transcodeTimer); transcodeTimer = null; }
-    cancelTranscode(currentRoot, transcodeCurrentRel);
-    transcodeCurrentRel = null;
-  }
+  abortActiveTranscode();
   // 先清理 FLV 状态再清空 src——否则 src='' 触发 error 事件，误判为播放失败而弹转码确认
   flvFailTarget = null;
+  audioFailTarget = null;
   currentIsFlv = false;
   videoEl.pause(); videoEl.src = '';
   audioEl.pause(); audioEl.src = '';
@@ -1877,7 +1997,13 @@ videoEl.addEventListener('error', () => {
   }
 });
 audioEl.addEventListener('error', () => {
-  $('player-hint').textContent = '⚠️ 该音频格式浏览器无法直接播放。';
+  // 关闭播放器清空 src 也会触发 error，忽略
+  if (!audioEl.currentSrc) return;
+  const t = audioFailTarget;
+  const ext = t ? String(t.name).split('.').pop().toUpperCase() : '';
+  $('player-hint').textContent = '⚠️ 该音频格式' + (ext ? '（' + ext + '）' : '') +
+    '浏览器无法解码，可下载后用本机播放器打开。';
+  if (t) promptDownload(t, '该音频格式' + (ext ? '（' + ext + '）' : '') + '浏览器无法解码，需要下载后用本机播放器播放。');
 });
 
 // ============================================================
