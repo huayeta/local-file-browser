@@ -1719,6 +1719,30 @@ function syncPlayProgress() {
 ['timeupdate', 'loadedmetadata', 'durationchange', 'seeked'].forEach(evt =>
   videoEl.addEventListener(evt, syncPlayProgress));
 
+// flv.js + MSE 拖动后的偶发卡顿自愈：
+//   拖动时 flv.js 只能定位到关键帧，播放头偶尔会落在已缓冲区间之前的零点几秒空隙里
+//   （currentTime < buffered.start(0)）→ readyState 停在 1、画面不动。
+//   检测到"卡在空隙中"就把播放头挪进最近缓冲区，避免用户以为播放器坏了。
+let videoStallTimer = null;
+function snapIntoTimelineGap() {
+  const b = videoEl.buffered;
+  if (!b || !b.length) return false;
+  const t = videoEl.currentTime;
+  for (let i = 0; i < b.length; i++) {
+    if (t >= b.start(i) && t <= b.end(i)) return false;   // 已在缓冲内，不动
+  }
+  for (let i = 0; i < b.length; i++) {
+    if (b.start(i) > t) { videoEl.currentTime = b.start(i) + 0.05; return true; }
+  }
+  return false;
+}
+['waiting', 'stalled'].forEach((evt) => videoEl.addEventListener(evt, () => {
+  clearTimeout(videoStallTimer);
+  videoStallTimer = setTimeout(() => { snapIntoTimelineGap(); }, 1200);
+}));
+['playing', 'seeked', 'pause'].forEach((evt) =>
+  videoEl.addEventListener(evt, () => clearTimeout(videoStallTimer)));
+
 // 视频播放失败提示：浏览器不支持的编码 → 弹"是否转码"确认（所有视频格式通用）
 videoEl.addEventListener('error', () => {
   // 关闭播放器/清空 src 时也会触发 error 事件（src 已空）——忽略，不弹转码
