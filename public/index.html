@@ -1442,7 +1442,13 @@ async function checkTranscodeStatus(rootIdx, dstPath) {
     const qs = new URLSearchParams({ root: rootIdx, path: dstPath });
     const res = await fetch('/local/api/transcode-status?' + qs.toString());
     const data = await res.json();
-    return { status: data.status || 'none', progress: data.progress || 0 };
+    return {
+      status: data.status || 'none',
+      progress: data.progress || 0,
+      mode: data.mode || null,
+      verifying: !!data.verifying,
+      corruptFallback: !!data.corruptFallback,
+    };
   } catch (e) { return { status: 'none', progress: 0 }; }
 }
 
@@ -1459,7 +1465,15 @@ function startTranscode(rootIdx, relPath, onProgress) {
           const st = await checkTranscodeStatus(rootIdx, dstPath);
           if (st.status === 'done') { resolve(true); return; }
           if (st.status === 'none') { resolve(false); return; } // 转码失败或已取消
-          if (onProgress) onProgress('转码中… ' + st.progress + '%');
+          if (onProgress) {
+            if (st.verifying) {
+              onProgress('正在校验源文件完整性…（约 1 分钟）');
+            } else if (st.corruptFallback) {
+              onProgress('检测到损坏帧，源流无法直接复制 → 正在完整重编码… ' + st.progress + '%');
+            } else {
+              onProgress('转码中… ' + st.progress + '%');
+            }
+          }
           transcodeTimer = setTimeout(poll, 1500);
         };
         poll();
@@ -1535,14 +1549,22 @@ async function playVideoWithTranscode(e) {
     const res = await fetch('/local/api/probe?' + qs.toString());
     const data = await res.json();
     if (data && data.available && data.supported === false) {
-      // ffprobe 探测到浏览器不支持的编码/容器 → 说明原因并提示转换
+      // ffprobe 探测到浏览器不支持的容器/编码 → 说明原因，并按最省的转换方式给出耗时
       const fmt = String(data.format || '').toUpperCase();
-      const why = data.reason === 'container'
-        ? `该文件实际是 ${fmt || '非 MP4'} 容器（扩展名与内容不符），浏览器不支持该容器`
-        : `该视频编码为 ${data.codec || '未知'}，浏览器无法直接播放`;
-      const how = data.remuxable
+      let why;
+      if (data.reason === 'container') {
+        why = `该文件实际是 ${fmt || '非 MP4'} 容器（扩展名与内容不符），浏览器不支持该容器`;
+      } else if (data.reason === 'audio') {
+        why = `该视频画面是 ${data.codec || 'H.264'}（可播），但音频是 ${String(data.audioCodec || '未知').toUpperCase()} 编码，浏览器无法解码`;
+      } else {
+        why = `该视频编码为 ${data.codec || '未知'}，浏览器无法直接播放`;
+      }
+      // mode: copy=只换容器(秒级) / audio=视频无损复制+音频转AAC(约1分钟) / reencode=完整重编码(较慢)
+      const how = data.mode === 'copy'
         ? '可点下方「转换（MP4）」——仅换容器、不重新编码，几秒即可播。'
-        : '可点下方「转换（MP4）」重新编码为 H.264（耗时较长，可随时取消）。';
+        : data.mode === 'audio'
+          ? '可点下方「转换（MP4）」——画面无损复制、只把音频转成 AAC，整集约 1 分钟（会先自动校验源文件是否有坏帧，如有则自动改为完整重编码，约 5 分钟）。'
+          : '可点下方「转换（MP4）」重新编码为 H.264（耗时较长，可随时取消）。';
       $('player-hint').textContent = '⚠️ ' + why + '。' + how;
       promptChoice(e);
       return;

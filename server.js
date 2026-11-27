@@ -669,6 +669,18 @@ function probeVideoInfo(full) {
   });
 }
 
+// 判定转码模式（决定 ffmpeg 参数与耗时/画质）：
+//   'copy'     视频+音频编码都受支持，只是容器不对（如 FLV/TS 改名 .mp4）→ 只换容器，秒级
+//   'audio'    视频编码受支持、音频不受支持（如 TS 里是 mp2）→ 视频无损复制，仅把音频转 AAC
+//   'reencode' 视频编码本身不受支持（如 VP6/RMVB）→ 完整重编码
+function transcodeModeOf(info) {
+  if (!info) return 'reencode';                             // 探测失败保守走完整重编码
+  const videoOk = !!info.videoCodec && SUPPORTED_VIDEO_CODECS.has(info.videoCodec);
+  const audioOk = !info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec);
+  if (!videoOk) return 'reencode';
+  return audioOk ? 'copy' : 'audio';
+}
+
 // 判断视频是否需转码：编码**或容器**任一不受浏览器支持 → 需要
 // （关键：常见"FLV 内容被改名成 .mp4"，编码是 h264 但容器 flv，浏览器同样无法播放）
 async function videoNeedsTranscode(full) {
@@ -676,7 +688,47 @@ async function videoNeedsTranscode(full) {
   if (!info) return true;                       // 无法探测时保守按需转码
   if (info.format && !SUPPORTED_VIDEO_FORMATS.has(info.format)) return true;
   if (info.videoCodec && !SUPPORTED_VIDEO_CODECS.has(info.videoCodec)) return true;
+  if (info.audioCodec && !SUPPORTED_AUDIO_CODECS.has(info.audioCodec)) return true;
   return false;
+}
+
+// 流完整性检查：完整解码一遍（不写文件）统计报错行数。
+// 为什么需要：广播/录制来源的 TS 常有"参考帧数超限""切片头错误"等缺陷，
+//   ffmpeg/VLC 能容错跳过，但 Chrome 解码管线遇到会直接 PIPELINE_ERROR_DECODE 整片失败。
+//   这类文件如果只做 -c:v copy（原样复制坏帧），产物在浏览器里必然播到坏点就崩，
+//   因此复制前必须先确认流干净；不干净就退回完整重编码（解码时由 ffmpeg 做错误掩盖，产物干净）。
+// 返回 { clean, errors }；超时/无法探测时保守返回 clean=false（宁可慢也不要给出坏产物）。
+function checkStreamClean(full, timeoutMs) {
+  return new Promise((resolve) => {
+    let out = '';
+    let settled = false;
+    const finish = (clean) => { if (!settled) { settled = true; resolve(clean); } };
+    let proc;
+    try {
+      proc = spawn(FFMPEG_PATH, ['-hide_banner', '-v', 'error', '-i', full, '-an', '-f', 'null', '-'],
+        { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) { return finish(false); }
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGKILL'); } catch (e) {}
+      finish(false);
+    }, timeoutMs || 300000);
+    proc.stderr.on('data', (chunk) => {
+      if (out.length < 200000) out += chunk.toString();
+    });
+    proc.on('error', () => { clearTimeout(timer); finish(false); });
+    proc.on('close', () => {
+      clearTimeout(timer);
+      const lines = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      finish(lines.length === 0);
+    });
+  });
+}
+
+// 判断某文件是否"复制有风险、需要先校验"：
+//   广播/录制类来源（.ts/.m2ts/.mts/.mpg/.mpeg）或 模式为 audio（TS 里 mp2 音频）
+function needsCleanCheck(full, mode) {
+  if (mode === 'reencode') return false;            // 本来就要重编码，无需校验
+  return mode === 'audio' || /\.(ts|m2ts|mts|mpg|mpeg)$/i.test(full);
 }
 
 // 转码产物路径：同目录同名 .mp4；若源文件本身已是 .mp4（内容可能是 FLV/TS 等），
@@ -706,16 +758,35 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
   const job = { proc: null, rootIndex, rel, srcFull, dstFull, dstPart, startAt: Date.now(), duration: 0, progress: 0 };
   transcodeJobs.set(jobId, job);
 
-  // 探测源视频（编码/容器/时长）。编码浏览器本身就支持（如 h264+aac 的 FLV 被改名 .mp4）
-  // → 只换容器（-c copy），几秒完成；编码不支持 → 完整重编码（libx264 + aac）
+  // 探测源视频（编码/容器/时长），据此选最省的模式：
+  //   copy     → 只换容器（-c copy），秒级
+  //   audio    → 视频无损复制 + 音频转 AAC（约 1 分钟/集，画质无损）
+  //   reencode → 完整重编码（libx264 + aac）
   const info = await probeVideoInfo(srcFull);
   job.duration = (info && info.duration) || await probeVideoDuration(srcFull);
-  const canCopy = !!(info && info.videoCodec && SUPPORTED_VIDEO_CODECS.has(info.videoCodec)
-    && (!info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec)));
-  job.copyMode = canCopy;
-  const codecArgs = canCopy
+  let mode = transcodeModeOf(info);
+  job.mode = mode;
+  job.verifying = false;
+
+  // 复制类模式（copy/audio）前先确认源流能被完整干净解码：
+  // 有坏帧的流若原样复制，浏览器会播到坏点整片崩溃（ffmpeg/VLC 却看不出来）。
+  if (needsCleanCheck(srcFull, mode)) {
+    job.verifying = true;
+    const clean = await checkStreamClean(srcFull);
+    job.verifying = false;
+    if (!clean) {
+      mode = 'reencode';
+      job.mode = mode;
+      job.corruptFallback = true;   // 前端据此提示"检测到损坏帧，改为完整重编码"
+    }
+  }
+
+  job.copyMode = mode === 'copy';
+  const codecArgs = mode === 'copy'
     ? ['-c', 'copy']
-    : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k'];
+    : mode === 'audio'
+      ? ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2']
+      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k'];
 
   const proc = spawn(FFMPEG_PATH, [
     '-y', '-i', srcFull,
@@ -835,17 +906,20 @@ function apiProbe(req, res, url) {
     }
     const formatOk = !info.format || SUPPORTED_VIDEO_FORMATS.has(info.format);
     const codecOk = !info.videoCodec || SUPPORTED_VIDEO_CODECS.has(info.videoCodec);
-    // reason: container（容器不支持，如 FLV 改名 .mp4）/ codec（编码不支持）/ null
-    const reason = !formatOk ? 'container' : (!codecOk ? 'codec' : null);
+    const audioOk = !info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec);
+    // reason: container（容器不支持，如 FLV/TS 改名 .mp4）/ codec（视频编码不支持）
+    //         audio（音频编码不支持，如 mp2）/ null
+    const reason = !formatOk ? 'container' : (!codecOk ? 'codec' : (!audioOk ? 'audio' : null));
+    const mode = transcodeModeOf(info);
     sendJson(res, 200, {
       codec: info.videoCodec,
       audioCodec: info.audioCodec,
       format: info.format,
       duration: info.duration,
-      supported: formatOk && codecOk,
-      // 可无损转封装（只换容器，秒级）：编码都受支持
-      remuxable: !!(info.videoCodec && SUPPORTED_VIDEO_CODECS.has(info.videoCodec)
-        && (!info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec))),
+      supported: formatOk && codecOk && audioOk,
+      // 转码模式：copy=只换容器 / audio=视频复制+音频转AAC / reencode=完整重编码
+      mode,
+      remuxable: mode === 'copy',
       reason,
       available: true,
     });
@@ -864,11 +938,21 @@ function apiTranscodeStatus(req, res, url) {
 
   let status = 'none';       // none | transcoding | done
   let progress = 0;          // 转码进度百分比（0-100）
+  let mode = null;           // copy | audio | reencode
+  let verifying = false;     // 正在校验源流完整性
+  let corruptFallback = false; // 校验发现坏帧 → 已升级为完整重编码
   for (const job of transcodeJobs.values()) {
-    if (job.dstFull === dstFull) { status = 'transcoding'; progress = job.progress || 0; break; }
+    if (job.dstFull === dstFull) {
+      status = 'transcoding';
+      progress = job.progress || 0;
+      mode = job.mode || null;
+      verifying = !!job.verifying;
+      corruptFallback = !!job.corruptFallback;
+      break;
+    }
   }
   if (status === 'none' && fs.existsSync(dstFull)) { status = 'done'; progress = 100; }
-  sendJson(res, 200, { status, exists: status === 'done', progress });
+  sendJson(res, 200, { status, exists: status === 'done', progress, mode, verifying, corruptFallback });
 }
 
 // ============================================================
