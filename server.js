@@ -621,6 +621,12 @@ const FFMPEG_PATH = CONFIG.ffmpegPath || 'ffmpeg';
 const FFPROBE_PATH = CONFIG.ffprobePath || 'ffprobe';
 // 浏览器原生支持的视频编码（无需转码）
 const SUPPORTED_VIDEO_CODECS = new Set(['h264', 'avc1', 'hevc', 'h265', 'vp8', 'vp9', 'av1']);
+// 浏览器原生支持的音频编码（-c copy 转封装时需一并受支持）
+const SUPPORTED_AUDIO_CODECS = new Set(['aac', 'mp3']);
+// 浏览器原生支持的容器（ffprobe format_name）；flv/mkv/avi/rm 等一律不支持
+const SUPPORTED_VIDEO_FORMATS = new Set([
+  'mp4', 'mov', 'm4a', 'm4v', '3gp', 'webm', 'ogg', 'ogv', 'mp3', 'wav', 'flac', 'aac',
+]);
 const transcodeJobs = new Map();  // jobId → { proc, rootIndex, rel, srcFull, dstFull, dstPart, startAt }
 
 // ffprobe 读取视频编码（promise 化）
@@ -650,17 +656,56 @@ function probeVideoDuration(full) {
   });
 }
 
-// 判断视频是否需转码：ffprobe 编码不在支持集合内 → 需要
+// ffprobe 一次性读取：视频编码 + 音频编码 + 容器格式 + 时长（promise 化）
+function probeVideoInfo(full) {
+  return new Promise((resolve) => {
+    execFile(FFPROBE_PATH,
+      ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name',
+        '-show_entries', 'format=format_name,duration', '-of', 'json', full],
+      (err, stdout) => {
+        if (err) return resolve(null);
+        try {
+          const j = JSON.parse(String(stdout));
+          const streams = j.streams || [];
+          const v = streams.find((s) => s.codec_type === 'video');
+          const a = streams.find((s) => s.codec_type === 'audio');
+          const fmt = String((j.format && j.format.format_name) || '')
+            .split(',')[0].trim().toLowerCase();
+          const dur = parseFloat((j.format && j.format.duration) || '0');
+          resolve({
+            videoCodec: ((v && v.codec_name) || '').toLowerCase() || null,
+            audioCodec: ((a && a.codec_name) || '').toLowerCase() || null,
+            format: fmt || null,
+            duration: Number.isFinite(dur) && dur > 0 ? dur : 0,
+          });
+        } catch (e) { resolve(null); }
+      });
+  });
+}
+
+// 判断视频是否需转码：编码**或容器**任一不受浏览器支持 → 需要
+// （关键：常见"FLV 内容被改名成 .mp4"，编码是 h264 但容器 flv，浏览器同样无法播放）
 async function videoNeedsTranscode(full) {
-  const codec = await probeVideoCodec(full);
-  if (!codec) return true; // 无法探测时保守按需转码
-  return !SUPPORTED_VIDEO_CODECS.has(codec);
+  const info = await probeVideoInfo(full);
+  if (!info) return true;                       // 无法探测时保守按需转码
+  if (info.format && !SUPPORTED_VIDEO_FORMATS.has(info.format)) return true;
+  if (info.videoCodec && !SUPPORTED_VIDEO_CODECS.has(info.videoCodec)) return true;
+  return false;
+}
+
+// 转码产物路径：同目录同名 .mp4；若源文件本身已是 .mp4（内容可能是 FLV/TS 等），
+// 追加 .播放版 后缀——否则产物与源文件同名，会被误判"已存在产物"而永不转码
+function transcodeDstOf(srcFull) {
+  const m = /^(.*?)(\.[^.\\/]+)?$/.exec(srcFull) || [];
+  const base = m[1] || srcFull;
+  const ext = (m[2] || '').toLowerCase();
+  return ext === '.mp4' ? base + '.播放版.mp4' : base + '.mp4';
 }
 
 // 启动转码任务：srcFull → 同目录 src.mp4（先写 .part，成功后 rename）
 async function startTranscodeJob(rootIndex, rel, srcFull) {
   // 若同目录已有转好的 .mp4（非 .part），直接复用，不重复转
-  const dstFull = srcFull.replace(/\.([^.]+)$/, '.mp4');
+  const dstFull = transcodeDstOf(srcFull);
   const dstPart = dstFull + '.part';
   if (fs.existsSync(dstFull)) {
     return { jobId: null, done: true, dstFull, message: '已存在转码产物' };
@@ -675,13 +720,20 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
   const job = { proc: null, rootIndex, rel, srcFull, dstFull, dstPart, startAt: Date.now(), duration: 0, progress: 0 };
   transcodeJobs.set(jobId, job);
 
-  // 异步读取源视频总时长（秒），用于计算转码进度百分比
-  job.duration = await probeVideoDuration(srcFull);
+  // 探测源视频（编码/容器/时长）。编码浏览器本身就支持（如 h264+aac 的 FLV 被改名 .mp4）
+  // → 只换容器（-c copy），几秒完成；编码不支持 → 完整重编码（libx264 + aac）
+  const info = await probeVideoInfo(srcFull);
+  job.duration = (info && info.duration) || await probeVideoDuration(srcFull);
+  const canCopy = !!(info && info.videoCodec && SUPPORTED_VIDEO_CODECS.has(info.videoCodec)
+    && (!info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec)));
+  job.copyMode = canCopy;
+  const codecArgs = canCopy
+    ? ['-c', 'copy']
+    : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k'];
 
   const proc = spawn(FFMPEG_PATH, [
     '-y', '-i', srcFull,
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-    '-c:a', 'aac', '-b:a', '128k',
+    ...codecArgs,
     '-movflags', '+faststart',
     '-f', 'mp4',   // 强制输出格式：.part 扩展名无法推断容器格式，不加会转码失败
     '-progress', 'pipe:1',   // 输出进度到 stdout（out_time_ms= 等键值对）
@@ -740,7 +792,11 @@ function apiTranscode(req, res, url) {
   if (stat.isDirectory()) return sendJson(res, 400, { error: '这是文件夹，不能转码' });
 
   startTranscodeJob(rootIndex, rel, full);
-  sendJson(res, 200, { ok: true, message: '转码已启动，完成前请勿重复操作', dst: full.replace(/\.([^.]+)$/, '.mp4') });
+  sendJson(res, 200, {
+    ok: true,
+    message: '转码已启动，完成前请勿重复操作',
+    dst: transcodeDstOf(full),
+  });
 }
 
 // API: /api/transcode-cancel?root=<i>&path=<rel> — 取消转码（kill ffmpeg + 清理 .part）
@@ -785,12 +841,28 @@ function apiProbe(req, res, url) {
   try { stat = fs.statSync(full); } catch (e) { return sendJson(res, 404, { error: '文件不存在' }); }
   if (stat.isDirectory()) return sendJson(res, 400, { error: '这是文件夹，不能探测' });
 
-  probeVideoCodec(full).then((codec) => {
-    if (!codec) {
-      sendJson(res, 200, { codec: null, supported: false, available: false });
+  probeVideoInfo(full).then((info) => {
+    if (!info) {
+      // ffprobe 不可用/探测失败：前端直接播放，播放失败再提示转码
+      sendJson(res, 200, { codec: null, format: null, supported: false, available: false });
       return;
     }
-    sendJson(res, 200, { codec, supported: SUPPORTED_VIDEO_CODECS.has(codec), available: true });
+    const formatOk = !info.format || SUPPORTED_VIDEO_FORMATS.has(info.format);
+    const codecOk = !info.videoCodec || SUPPORTED_VIDEO_CODECS.has(info.videoCodec);
+    // reason: container（容器不支持，如 FLV 改名 .mp4）/ codec（编码不支持）/ null
+    const reason = !formatOk ? 'container' : (!codecOk ? 'codec' : null);
+    sendJson(res, 200, {
+      codec: info.videoCodec,
+      audioCodec: info.audioCodec,
+      format: info.format,
+      duration: info.duration,
+      supported: formatOk && codecOk,
+      // 可无损转封装（只换容器，秒级）：编码都受支持
+      remuxable: !!(info.videoCodec && SUPPORTED_VIDEO_CODECS.has(info.videoCodec)
+        && (!info.audioCodec || SUPPORTED_AUDIO_CODECS.has(info.audioCodec))),
+      reason,
+      available: true,
+    });
   });
 }
 

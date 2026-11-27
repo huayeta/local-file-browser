@@ -1339,8 +1339,12 @@ let transcodeCurrentRel = null;  // 当前正在转码的视频相对路径（�
 let flvFailTarget = null;        // 当前尝试播放的视频文件（不限 .flv；播放失败 error 回调里弹转码用）
 
 // 同目录转码产物的相对路径（如 /a.flv → /a.mp4）
+// 源文件本身已是 .mp4（真实容器可能不符，如 FLV 改名）→ 加 .播放版 后缀，避免与源文件同名
 function transcodeDstPath(relPath) {
-  return relPath.replace(/\.[^.]+$/, '.mp4');
+  const m = /^(.*?)(\.[^./\\]+)?$/.exec(relPath) || [];
+  const base = m[1] || relPath;
+  const ext = (m[2] || '').toLowerCase();
+  return ext === '.mp4' ? base + '.播放版.mp4' : base + '.mp4';
 }
 
 // 查询转码状态：返回 { status: none|transcoding|done, progress: 0-100 }
@@ -1392,6 +1396,8 @@ async function playVideoWithTranscode(e) {
   const rootIdx = currentRoot;
   const isFlv = /\.flv$/i.test(e.name);
   const dstPath = transcodeDstPath(e.path);
+  // 先记录当前目标：任何分支下播放失败（error）都能据此弹转码确认
+  flvFailTarget = e;
   const st = await checkTranscodeStatus(rootIdx, dstPath);
   if (st.status === 'done') {
     // 已有转码产物 → 直接播放 MP4（H.264，原生 video 即可，支持拖拽）
@@ -1440,7 +1446,15 @@ async function playVideoWithTranscode(e) {
     const res = await fetch('/local/api/probe?' + qs.toString());
     const data = await res.json();
     if (data && data.available && data.supported === false) {
-      // ffprobe 探测到浏览器不支持的编码 → 提示转码
+      // ffprobe 探测到浏览器不支持的编码/容器 → 说明原因并提示转换
+      const fmt = String(data.format || '').toUpperCase();
+      const why = data.reason === 'container'
+        ? `该文件实际是 ${fmt || '非 MP4'} 容器（扩展名与内容不符），浏览器不支持该容器`
+        : `该视频编码为 ${data.codec || '未知'}，浏览器无法直接播放`;
+      const how = data.remuxable
+        ? '可点下方「转换（MP4）」——仅换容器、不重新编码，几秒即可播。'
+        : '可点下方「转换（MP4）」重新编码为 H.264（耗时较长，可随时取消）。';
+      $('player-hint').textContent = '⚠️ ' + why + '。' + how;
       promptChoice(e);
       return;
     }
@@ -1711,7 +1725,7 @@ videoEl.addEventListener('error', () => {
   if (!videoEl.currentSrc) return;
   if (flvFailTarget) {
     // 正在尝试播放的文件播放失败 → 多为编码/容器不支持 → 弹转码确认
-    $('player-hint').textContent = '⚠️ 该视频编码浏览器无法直接播放，正在准备转码…';
+    $('player-hint').textContent = '⚠️ 该视频浏览器无法直接播放（容器或编码不受支持），请在下方选择「转换（MP4）」。';
     promptChoice(flvFailTarget);
   } else if (currentIsFlv) {
     $('player-hint').textContent = '⚠️ 该 FLV 视频为旧编码（如 VP6，flv.js 仅支持 H.264 编码），浏览器无法播放。建议用格式工厂/ffmpeg 转码为 MP4（H.264）后再播放。';
