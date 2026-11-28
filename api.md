@@ -184,10 +184,10 @@
 - 多关键词空格 AND；全角/半角、大小写归一化；排序优先级：文件名命中 > 仅路径命中，文件夹优先，再按匹配度
 - `scope=all`：**并行**遍历所有根，每根结果上限 `ceil(searchMaxResults / 根数)`，某根配额满即停止该根（其它根不受影响），既能覆盖多个根，也不会被单个超大根拖死
 
-**限制**（来自 config.json，可配置）：
-- `searchTimeoutMs`：整体超时（默认 10000ms），超时返回已找到部分 + `truncated: true`
-- `searchMaxDepth`：最大递归深度（默认 8 层）
-- `searchMaxResults`：结果上限（默认 200 条）
+**限制**（均取自 `config.json`，**以 config.json 为准**；括号内为 `config.example.json` 示例值）：
+- `searchTimeoutMs`：整体超时（示例 10000ms），超时返回已找到部分 + `truncated: true`
+- `searchMaxDepth`：最大递归深度（示例 8 层）
+- `searchMaxResults`：结果上限（示例 200 条）
 
 **错误**：`400`（无效 root）、`403`（路径越界）、`404`（路径不存在）、`500`（搜索失败）
 

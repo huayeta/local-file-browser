@@ -91,6 +91,8 @@ node server.js
 | `roots` | 根目录数组：`name` 显示名、`path` 本地绝对路径 | 必填 |
 | `shortcuts` | 快捷访问：`root` 根目录索引（对应 roots 顺序）、`path` 该根目录内的相对路径 | 可选 |
 
+> 表中「默认值」为 `config.example.json` 的示例值；**实际运行以你的 `config.json` 为准**（如 `searchTimeoutMs` / `searchMaxDepth` / `searchMaxResults` 均按 config.json 中的取值生效）。
+
 > 修改 config.json 后自动热重载，无需重启进程。
 >
 > **视频转码依赖**：浏览器无法直接播放的视频（如 VP6 编码的 .flv）会在播放时提示是否转码为 MP4。转码需要安装 ffmpeg/ffprobe 并配置上方两个路径（macOS 可用 `brew install ffmpeg`；Windows 到 ffmpeg 官网下载后填完整路径）。
