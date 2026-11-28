@@ -22,7 +22,8 @@
 | `GET /api/roots` | 根目录列表 + 快捷访问 + 前端配置 |
 | `GET /api/reload` | 手动重载 config.json（与自动热重载等效） |
 | `GET /api/list` | 列目录 |
-| `GET /api/search` | 递归搜索 |
+| `GET /api/search` | 递归搜索（可单根 / 全部根） |
+| `GET /api/search-stream` | 流式递归搜索（NDJSON，边搜边出） |
 | `GET /file` | 文件服务（播放/查看/下载） |
 | `GET /api/transcode` | 启动视频转码（ffmpeg，不支持编码转 MP4） |
 | `GET /api/transcode-cancel` | 取消转码（kill ffmpeg 进程 + 清理 .part） |
@@ -127,24 +128,31 @@
 
 ---
 
-## 5. `GET /api/search?root=<i>&q=<关键词>`
+## 5. 搜索接口
 
-在当前根目录内递归搜索文件名（不区分大小写、中文直接匹配、多关键词空格 AND、全角/半角归一化、按匹配度排序）。
+### 5.1 `GET /api/search?root=<i>&q=<关键词>`
+
+递归搜索文件名（不区分大小写、中文直接匹配、多关键词空格 AND、全角/半角归一化、按匹配度排序）。可用 `scope=all` 搜索全部根目录。
 
 **参数**：
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `root` | 否 | 根目录索引，默认 `0` |
+| `root` | 否 | 根目录索引，默认 `0`（`scope=all` 时忽略） |
 | `q` | 是 | 关键词（多词用空格分隔，AND 匹配） |
+| `scope` | 否 | 搜索范围：`root`（默认，仅当前根）/ `all`（全部根目录） |
+| `inPath` | 否 | `1`/`true` 时除文件名外也匹配上级目录路径（默认 `0`/`false`） |
 
 **响应**：`200 OK`
 
 ```json
 {
   "query": "学习",
-  "root": { "index": 0, "name": "视频库", "path": "/Users/zhuhui/Movies" },
-  "total": 3,
+  "scope": "all",
+  "root": { "scope": "all", "roots": [ { "index": 0, "name": "视频库" }, { "index": 1, "name": "音乐库" } ] },
+  "inPath": false,
+  "total": 2,
+  "matched": 2,
   "truncated": false,
   "results": [
     {
@@ -153,7 +161,10 @@
       "kind": "dir",
       "size": 0,
       "mtime": "2026-08-01T10:00:00.000Z",
-      "path": "/学习"
+      "path": "/学习",
+      "rootIndex": 0,
+      "rootName": "视频库",
+      "pathOnly": false
     }
   ]
 }
@@ -161,9 +172,17 @@
 
 | 字段 | 说明 |
 |---|---|
-| `total` | 返回的结果数量 |
-| `truncated` | 是否被截断：搜索超时（见 `searchTimeoutMs`）或结果超过上限（见 `searchMaxResults`）时为 `true` |
-| `results` | 结果数组（字段同 `/api/list` 的 entries，文件夹优先、按匹配度排序） |
+| `scope` | 本次搜索范围：`root` / `all` |
+| `root` | 单根时为 `{ index, name, path }`；`scope=all` 时为 `{ "scope":"all", "roots":[{index,name}] }` |
+| `inPath` | 是否启用「含文件夹名」 |
+| `total` | 返回的结果数量（已按 `searchMaxResults` 截断后的条数） |
+| `matched` | 命中总数；`scope=all` 因每根配额到顶会提前停止，此时为「至少」的下界 |
+| `truncated` | 是否被截断：超时 / 命中超过上限 / 多根配额已满 |
+| `results` | 结果数组，字段同 `/api/list` 的 entries，并额外带 `rootIndex`、`rootName`（来源根）、`pathOnly`（是否为「仅路径命中」） |
+
+**说明**：
+- 多关键词空格 AND；全角/半角、大小写归一化；排序优先级：文件名命中 > 仅路径命中，文件夹优先，再按匹配度
+- `scope=all`：**并行**遍历所有根，每根结果上限 `ceil(searchMaxResults / 根数)`，某根配额满即停止该根（其它根不受影响），既能覆盖多个根，也不会被单个超大根拖死
 
 **限制**（来自 config.json，可配置）：
 - `searchTimeoutMs`：整体超时（默认 10000ms），超时返回已找到部分 + `truncated: true`
@@ -171,6 +190,28 @@
 - `searchMaxResults`：结果上限（默认 200 条）
 
 **错误**：`400`（无效 root）、`403`（路径越界）、`404`（路径不存在）、`500`（搜索失败）
+
+---
+
+### 5.2 `GET /api/search-stream?root=<i>&q=<关键词>`
+
+流式搜索：边遍历边以 NDJSON（每行一个 JSON）下发，首屏很快就能看到结果。参数与 5.1 相同（`root`、`q`、`scope`、`inPath`）。前端实际使用的就是该接口。
+
+**响应**：`200 OK`，`Content-Type: application/x-ndjson; charset=utf-8`，逐行输出以下帧：
+
+```jsonc
+{"type":"batch","results":[ /* 单条结果，字段同 5.1 results */ ]}
+{"type":"done","query":"学习","scope":"all","root":{...},"inPath":false,"results":[ /* 最终排序+截断后的完整列表 */ ],"total":2,"matched":2,"truncated":false,"timedOut":false}
+{"type":"error","error":"搜索失败: ..."}
+```
+
+| 帧 | 说明 |
+|---|---|
+| `batch` | 每积累约 20 条或静默 150ms 下发一批；流式阶段顺序为遍历顺序，请以 `done` 帧的 `results` 为最终列表 |
+| `done` | 结束帧：`results` 为最终排序 + 截断后的列表，`timedOut` 标记是否因超时中断 |
+| `error` | 搜索出错 |
+
+**说明**：客户端断开（换关键词 / 关页面）时服务端会立即停止遍历；错误码同 5.1。
 
 ---
 
@@ -223,7 +264,7 @@ PDF.js 查看器静态资源（`public/pdfjs/` 目录，如 `pdf.min.mjs`、`pdf
 
 ## 8. `GET /api/transcode?root=<i>&path=<rel>`
 
-启动视频转码：浏览器无法直接播放的视频（如 VP6 编码的 .flv）用 ffmpeg 转成 H.264 MP4。**转码产物与源文件同目录并存（不删除源文件）**，先写 `.part` 临时文件，转码成功校验后 rename 为 `.mp4`（原子操作）。
+启动视频转码：浏览器无法直接播放的视频（如 VP6 编码的 .flv）用 ffmpeg 转成 H.264 MP4。产物与源文件同目录，先写 `.part` 临时文件，转码成功校验后 rename 为 `.mp4`（原子操作）。**默认转码成功且校验通过后会删除源文件以节省空间**（`config.json` 的 `deleteSourceAfterTranscode` 设为 `false` 可保留源文件）；完成/删源后该目录的列表缓存与搜索缓存会主动失效，接口立即反映最新内容。
 
 **参数**：
 
