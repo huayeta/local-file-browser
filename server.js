@@ -74,6 +74,15 @@ function statCached(full) {
   return info;
 }
 
+// 主动失效某目录的列表缓存：转码产出/删除源文件后立即让 /api/list 反映最新内容，
+// 不必等目录 mtime 变化或 60s TTL 兜底（网络盘上 mtime 精度/延迟不可靠）
+function invalidateListCacheForDir(rootIndex, dirFull) {
+  const root = CONFIG.roots[rootIndex];
+  let rel = '';
+  if (root) rel = path.relative(root.path, dirFull).split(path.sep).join('/');
+  listCache.delete(`${rootIndex}:${rel}`);
+}
+
 // ============================================================
 // 配置热重载：修改 config.json 后自动生效，无需重启
 //   · 手动触发：GET /api/reload
@@ -382,23 +391,31 @@ function matchScore(normName, keywords) {
   return score;
 }
 
-// 递归遍历（并发池 + 异步 stat + 逐条回调）
-//   ctx: { rootFull, keywords, cancelled, timedOut, maxDepth, maxResults,
-//          results, matched, overflow }
+// 递归遍历单个根目录（并发池 + 异步 stat + 逐条回调）
+//   w: 每个根独立的遍历上下文
+//      { rootFull, rootIndex, rootName, keywords, inPath, maxDepth,
+//        perRootLimit, earlyStop, concurrency, nameResults, pathResults,
+//        matched, overflow, quotaFull, cancelled, timedOut, master }
+//   master: 共享控制 { cancelled, timedOut }（取消/超时对整体生效）
 //   onMatch(item)：每命中一条就回调一次（用于流式下发）
-async function searchWalk(ctx, onMatch) {
-  const CONCURRENCY = 6;   // 并发读目录：网络盘上串行会把每次 readdir 的延迟累加
-  const queue = [{ abs: ctx.rootFull, rel: '', depth: 0 }];
+// 排序优先级：文件名命中 > 仅路径命中；同类内文件夹优先 → 匹配度 → 路径
+async function searchWalk(w, onMatch) {
+  const CONCURRENCY = w.concurrency || 6;   // 并发读目录：网络盘上串行会把每次 readdir 的延迟累加
+  const queue = [{ abs: w.rootFull, rel: '', depth: 0 }];
   let running = 0;
 
+  // 停止条件：全局取消/超时，或本根配额已满（多根并行时只停本根，不影响其它根）
+  const stopped = () => w.cancelled || w.timedOut || w.quotaFull
+    || (w.master && (w.master.cancelled || w.master.timedOut));
+
   const processDir = async (job) => {
-    if (ctx.cancelled || ctx.timedOut) return;
+    if (stopped()) return;
     let dirents;
     try {
       dirents = await fs.promises.readdir(job.abs, { withFileTypes: true });
     } catch (e) { return; }   // 目录不可读则跳过
     for (const ent of dirents) {
-      if (ctx.cancelled || ctx.timedOut) return;
+      if (stopped()) return;
       const name = ent.name;
       // 跳过隐藏项（.开头、.DS_Store、回收站等）
       if (name.startsWith('.') || name === '$RECYCLE.BIN') continue;
@@ -407,7 +424,19 @@ async function searchWalk(ctx, onMatch) {
 
       const isDir = ent.isDirectory();
       const childRel = job.rel ? job.rel + '/' + name : name;
-      const score = matchScore(normalizeText(name), ctx.keywords);
+      const normName = normalizeText(name);
+
+      // 1) 先按文件名打分（所有关键词都要在名字里）
+      let score = matchScore(normName, w.keywords);
+      let pathOnly = false;
+      // 2) 名字没全中，且开启了"含文件夹名" → 再看整条路径里是否齐全
+      if (score === 0 && w.inPath) {
+        const normPath = normalizeText('/' + childRel);
+        if (w.keywords.every((kw) => normPath.includes(kw))) {
+          score = 1;          // 仅路径命中：固定低分，保证排在文件名命中之后
+          pathOnly = true;
+        }
+      }
 
       if (score > 0) {
         const childFull = path.join(job.abs, name);
@@ -418,8 +447,10 @@ async function searchWalk(ctx, onMatch) {
           size = isDir ? 0 : st.size;
           mtime = st.mtime;
         } catch (e) { /* ignore */ }
-        ctx.matched++;
-        if (ctx.results.length < ctx.maxResults) {
+        w.matched++;
+        // 两类各自限流：避免"仅路径命中"把名额占满，把真正的文件名命中挤掉
+        const bucket = pathOnly ? w.pathResults : w.nameResults;
+        if (bucket.length < w.perRootLimit) {
           const item = {
             name,
             isDir,
@@ -427,16 +458,27 @@ async function searchWalk(ctx, onMatch) {
             size,
             mtime: mtime ? mtime.toISOString() : null,
             path: '/' + childRel,
+            rootIndex: w.rootIndex,   // 结果来源根目录（多根搜索时前端据此标注/跳转）
+            rootName: w.rootName,
             score,
+            pathOnly,
           };
-          ctx.results.push(item);
+          bucket.push(item);
           if (onMatch) onMatch(item);
+          // 多根并行：本根配额已满就停止本根（其它根照常扫，避免在超大根上白扫）
+          if (w.earlyStop
+              && (w.nameResults.length >= w.perRootLimit || w.pathResults.length >= w.perRootLimit)) {
+            w.quotaFull = true;
+            w.overflow = true;
+            return;
+          }
         } else {
-          ctx.overflow = true;   // 已到上限：继续遍历只为统计命中数/判断截断
+          w.overflow = true;   // 已到本根上限
+          if (w.earlyStop) { w.quotaFull = true; return; }
         }
       }
 
-      if (isDir && job.depth + 1 <= ctx.maxDepth) {
+      if (isDir && job.depth + 1 <= w.maxDepth) {
         queue.push({ abs: path.join(job.abs, name), rel: childRel, depth: job.depth + 1 });
       }
     }
@@ -444,7 +486,7 @@ async function searchWalk(ctx, onMatch) {
 
   await new Promise((resolve) => {
     const pump = () => {
-      if (ctx.cancelled || ctx.timedOut) {
+      if (stopped()) {
         if (running === 0) resolve();
         return;   // 否则等运行中的任务结束后再收尾
       }
@@ -462,30 +504,54 @@ async function searchWalk(ctx, onMatch) {
   });
 }
 
-// 排序：文件夹优先 → 匹配度 → 路径
+// 合并两类结果并按上限截断（文件名命中优先占位）
+function finalizeResults(ctx) {
+  const names = sortSearchResults(ctx.nameResults.slice());
+  const paths = sortSearchResults(ctx.pathResults.slice());
+  return names.concat(paths).slice(0, ctx.maxResults);
+}
+
+// 排序：文件名命中优先 → 文件夹优先 → 匹配度 → 根目录 → 路径
 function sortSearchResults(list) {
   return list.sort((a, b) => {
+    if (!!a.pathOnly !== !!b.pathOnly) return a.pathOnly ? 1 : -1;
     if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
     if (b.score !== a.score) return b.score - a.score;
+    if ((a.rootIndex || 0) !== (b.rootIndex || 0)) return (a.rootIndex || 0) - (b.rootIndex || 0);
     return a.path.localeCompare(b.path, 'zh-CN');
   });
 }
 
-// 搜索公共部分：校验参数 → 建 ctx → 起超时 → 遍历
-//   返回 { ctx, timeoutMs, timer } 或 null（已写错误响应）
-function prepareSearch(rootIndex, root, q, res) {
-  const resolved = resolveWithinRoot(root, '');
-  if (!resolved.ok) { sendJson(res, resolved.status, { error: resolved.error }); return null; }
+// 解析要扫描的根目录：scope=all → 全部根；否则只看传入的那一个
+function resolveSearchTargets(rootIndex, scopeAll) {
+  const list = scopeAll
+    ? CONFIG.roots.map((r, i) => ({ index: i, root: r }))
+    : [{ index: rootIndex, root: CONFIG.roots[rootIndex] }];
+  const out = [];
+  for (const t of list) {
+    if (!t.root) continue;
+    const resolved = resolveWithinRoot(t.root, '');
+    if (resolved.ok) out.push({ index: t.index, name: t.root.name, rootPath: t.root.path, full: resolved.full });
+  }
+  return out;
+}
+
+// 搜索公共部分：校验参数 → 建 ctx → 起超时
+//   返回 { ctx, timer, targets } 或 null（已写错误响应）
+function prepareSearch(q, res, opts) {
+  const targets = resolveSearchTargets(opts.rootIndex, opts.scopeAll);
+  if (targets.length === 0) { sendJson(res, 400, { error: '无效的 root 索引' }); return null; }
 
   const ctx = {
-    rootFull: resolved.full,
     keywords: q.split(/\s+/).filter(Boolean).map(normalizeText),
+    inPath: opts.inPath === '1' || opts.inPath === 'true',   // 是否把文件夹名也纳入匹配
     cancelled: false,
     timedOut: false,
     // 深度/上限/超时都动态读取，config.json 热重载后立即生效
     maxDepth: CONFIG.searchMaxDepth || 6,
     maxResults: CONFIG.searchMaxResults || 200,
-    results: [],
+    nameResults: [],   // 文件名命中（各根结果合并）
+    pathResults: [],   // 仅路径命中（文件夹名里含关键词）
     matched: 0,
     overflow: false,
   };
@@ -496,7 +562,35 @@ function prepareSearch(rootIndex, root, q, res) {
 
   const timeoutMs = CONFIG.searchTimeoutMs || 10000;
   const timer = setTimeout(() => { ctx.timedOut = true; }, timeoutMs);
-  return { ctx, timeoutMs, timer };
+  return { ctx, timer, targets };
+}
+
+// 并行扫描所有目标根目录：每根独立上下文 + 每根配额，互不阻塞
+//   · scope=root（单根）时与旧版一致：整根扫完、精确命中数
+//   · scope=all（多根）时并行扫描，每根最多 maxResults/n 条，先到先得，
+//     避免超大根（如十几 TB 的网络盘）把 200 个名额吃满、后续根轮不到
+async function walkAllTargets(ctx, targets, onMatch) {
+  const n = targets.length;
+  const perRootLimit = n <= 1 ? ctx.maxResults : Math.max(1, Math.ceil(ctx.maxResults / n));
+  const concurrency = n <= 1 ? 6 : Math.max(2, Math.floor(12 / n));  // 并行时降低每根并发，避免网络盘过载
+  const earlyStop = n > 1;   // 多根时才"配额满即停本根"；单根保持整根遍历以给出精确命中数
+
+  await Promise.all(targets.map((t) => {
+    const w = {
+      rootFull: t.full, rootIndex: t.index, rootName: t.name,
+      keywords: ctx.keywords, inPath: ctx.inPath,
+      maxDepth: ctx.maxDepth, perRootLimit, earlyStop, concurrency,
+      nameResults: [], pathResults: [], matched: 0, overflow: false, quotaFull: false,
+      cancelled: false, timedOut: false, master: ctx,   // master 共享取消/超时
+    };
+    return searchWalk(w, onMatch).then(() => {
+      ctx.matched += w.matched;
+      // 本根结果并入全局池（finalizeResults 统一排序 + 按 maxResults 截断）
+      for (const it of w.nameResults) ctx.nameResults.push(it);
+      for (const it of w.pathResults) ctx.pathResults.push(it);
+      if (w.overflow || w.quotaFull) ctx.overflow = true;
+    });
+  }));
 }
 
 // API: /api/search?root=<i>&q=<关键词> — 一次性返回 JSON（保留兼容/脚本调用）
@@ -510,21 +604,28 @@ function apiSearch(req, res, url) {
     return sendJson(res, 200, { query: '', root: { index: rootIndex, name: root.name }, total: 0, matched: 0, truncated: false, results: [] });
   }
 
-  const prep = prepareSearch(rootIndex, root, q, res);
+  const inPath = url.searchParams.get('inPath') || '';
+  const scopeAll = (url.searchParams.get('scope') || '') === 'all';   // scope=all → 搜索全部根目录
+  const prep = prepareSearch(q, res, { rootIndex, scopeAll, inPath });
   if (!prep) return;
-  const { ctx, timer } = prep;
+  const { ctx, timer, targets } = prep;
 
-  searchWalk(ctx, null).then(() => {
+  walkAllTargets(ctx, targets, null).then(() => {
     clearTimeout(timer);
     if (ctx.cancelled) return;   // 客户端已断开，不再写响应
 
-    sortSearchResults(ctx.results);
-    // truncated：超时 / 命中数确实超过上限
-    const truncated = ctx.timedOut || ctx.overflow;
-    const results = ctx.results.map(({ score, ...rest }) => rest);
+    const merged = finalizeResults(ctx);
+    // truncated：超时 / 命中数确实超过上限（含合并后截掉的部分）
+    const truncated = ctx.timedOut || ctx.overflow
+      || (ctx.nameResults.length + ctx.pathResults.length > ctx.maxResults);
+    const results = merged.map(({ score, ...rest }) => rest);
     sendJson(res, 200, {
       query: q,
-      root: { index: rootIndex, name: root.name, path: root.path },
+      scope: scopeAll ? 'all' : 'root',
+      root: scopeAll
+        ? { scope: 'all', roots: targets.map(t => ({ index: t.index, name: t.name })) }
+        : { index: rootIndex, name: root.name, path: root.path },
+      inPath: ctx.inPath,
       total: results.length,
       matched: ctx.matched,      // 真实命中总数（可能大于 total）
       truncated,
@@ -550,9 +651,11 @@ function apiSearchStream(req, res, url) {
     return sendJson(res, 200, { query: '', total: 0, matched: 0, truncated: false, results: [] });
   }
 
-  const prep = prepareSearch(rootIndex, root, q, res);
+  const inPath = url.searchParams.get('inPath') || '';
+  const scopeAll = (url.searchParams.get('scope') || '') === 'all';   // scope=all → 搜索全部根目录
+  const prep = prepareSearch(q, res, { rootIndex, scopeAll, inPath });
   if (!prep) return;
-  const { ctx, timer } = prep;
+  const { ctx, timer, targets } = prep;
 
   res.writeHead(200, {
     'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -582,7 +685,7 @@ function apiSearchStream(req, res, url) {
   };
 
   const startedAt = Date.now();
-  searchWalk(ctx, onMatch).then(() => {
+  walkAllTargets(ctx, targets, onMatch).then(() => {
     clearTimeout(timer);
     flush();
     // 诊断日志：只记录"被取消"或"耗时超过 1 秒"的搜索，避免刷屏
@@ -593,17 +696,22 @@ function apiSearchStream(req, res, url) {
         + `${ctx.timedOut ? '（超时中断）' : ''}`);
     }
     if (ctx.cancelled) { ended = true; try { res.end(); } catch (e) {} return; }
-    sortSearchResults(ctx.results);
+    const merged = finalizeResults(ctx);
     send({
       type: 'done',
       query: q,
-      root: { index: rootIndex, name: root.name, path: root.path },
-      total: ctx.results.length,
+      scope: scopeAll ? 'all' : 'root',
+      root: scopeAll
+        ? { scope: 'all', roots: targets.map(t => ({ index: t.index, name: t.name })) }
+        : { index: rootIndex, name: root.name, path: root.path },
+      inPath: ctx.inPath,
+      // 流式阶段可能已发出多余条数（两桶各限流），done 帧给出最终确定的列表
+      results: merged.map(({ score, ...rest }) => rest),
+      total: merged.length,
       matched: ctx.matched,
-      truncated: ctx.timedOut || ctx.overflow,
+      truncated: ctx.timedOut || ctx.overflow
+        || (ctx.nameResults.length + ctx.pathResults.length > ctx.maxResults),
       timedOut: ctx.timedOut,
-      // 最终顺序（前端据此重排，避免流式到达顺序导致列表跳动）
-      order: ctx.results.map((r) => r.path),
     });
     ended = true;
     try { res.end(); } catch (e) {}
@@ -1068,6 +1176,14 @@ async function startTranscodeJob(rootIndex, rel, srcFull) {
         console.warn(`⚠️ 产物校验未通过，已保留源文件: ${path.basename(srcFull)}`);
       }
     }
+
+    // 主动失效缓存：产物已就位 / 源文件已删除 → 立即让列表与搜索反映变化，不等 60s
+    try {
+      invalidateListCacheForDir(rootIndex, path.dirname(srcFull));
+      statCache.delete(srcFull);
+      statCache.delete(dstFull);
+      statCache.delete(dstPart);
+    } catch (e) { /* 缓存失效失败不影响主流程 */ }
   });
 
   return { jobId, done: false, dstFull, message: '转码中' };

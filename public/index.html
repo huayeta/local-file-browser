@@ -78,7 +78,19 @@
   }
   #search-input:focus { border-color: var(--accent); }
   #search-input::placeholder { color: var(--muted); }
-  #search-type {
+  /* 「含文件夹名」开关：开启后关键词可匹配到上级目录名 */
+  #search-inpath-wrap {
+    display: flex; align-items: center; gap: 4px; font-size: 12px;
+    color: var(--muted); cursor: pointer; white-space: nowrap; user-select: none;
+  }
+  #search-inpath-wrap:hover { color: var(--text); }
+  #search-inpath-wrap input { accent-color: var(--accent); cursor: pointer; margin: 0; }
+  /* 仅路径命中的结果标记 */
+  .path-badge {
+    font-size: 10px; color: var(--dir); border: 1px solid var(--dir);
+    border-radius: 3px; padding: 0 3px; margin-left: 6px; flex-shrink: 0;
+  }
+  #search-type, #search-scope {
     background: var(--panel2); border: 1px solid var(--border); color: var(--text);
     border-radius: 8px; padding: 5px 6px; font-size: 12px; outline: none; cursor: pointer;
   }
@@ -488,6 +500,13 @@
   <div id="search-box">
     <input id="search-input" type="search" list="search-history-dl" placeholder="🔍 搜索文件..." autocomplete="off">
     <datalist id="search-history-dl"></datalist>
+    <label id="search-inpath-wrap" title="除文件名外，也匹配上级文件夹名（如搜「华罗庚 和差问题」）">
+      <input type="checkbox" id="search-inpath">含文件夹名
+    </label>
+    <select id="search-scope" title="搜索范围：仅当前根目录 / 全部根目录">
+      <option value="root">当前根</option>
+      <option value="all">全部根</option>
+    </select>
     <select id="search-type">
       <option value="">全部</option>
       <option value="video">视频</option>
@@ -853,7 +872,9 @@ function jumpToShortcut(s) {
 // ============================================================
 // 文件列表加载
 // ============================================================
-async function loadList() {
+async function loadList(opts) {
+  // 列表刷新（如转码完成/删源后）时主动清搜索缓存，避免搜索页显示最多 60s 的旧结果
+  if (opts && opts.invalidateSearchCache) clearSearchCache();
   loadingEl.style.display = 'block';
   fileListEl.innerHTML = '';
   breadcrumbEl.innerHTML = '';
@@ -1129,7 +1150,8 @@ function getVisited() {
 }
 
 function markVisited(e) {
-  const id = currentRoot + ':' + e.path;
+  const rid = (e && e.rootIndex != null) ? e.rootIndex : currentRoot;
+  const id = rid + ':' + e.path;
   const arr = getVisited().filter(x => x !== id);
   arr.unshift(id);
   if (arr.length > VISITED_MAX) arr.length = VISITED_MAX;
@@ -1137,7 +1159,8 @@ function markVisited(e) {
 }
 
 function isVisited(e) {
-  return getVisited().includes(currentRoot + ':' + e.path);
+  const rid = (e && e.rootIndex != null) ? e.rootIndex : currentRoot;
+  return getVisited().includes(rid + ':' + e.path);
 }
 
 // ============================================================
@@ -1145,6 +1168,8 @@ function isVisited(e) {
 // ============================================================
 const searchInput = $('search-input');
 const searchTypeSel = $('search-type');
+const searchScopeSel = $('search-scope');    // 「搜索范围」：当前根 / 全部根
+const searchInPathEl = $('search-inpath');   // 「含文件夹名」开关
 const searchClearBtn = $('search-clear');
 let searchController = null;  // 当前搜索请求的 AbortController
 let searchSeq = 0;            // 请求序号，防止旧结果晚到覆盖新结果
@@ -1155,6 +1180,7 @@ let searchTruncated = false;  // 搜索是否被截断（超时/结果过多）�
 let searchMatched = 0;        // 服务端真实命中总数（可能大于实际下发的条数）
 let searchTimedOut = false;   // 是否因超时中断遍历
 let searchStreaming = false;  // 是否正在流式接收（用于避免"未找到"闪烁）
+let searchScopeAll = false;   // 当前搜索结果是否为"全部根目录"范围（渲染时据此标注来源根）
 
 // 搜索结果内存缓存：返回搜索页时直接出结果，不重复请求后台
 //   key = `${当前根目录}:${关键词}`（搜索结果与根目录强相关）
@@ -1164,7 +1190,9 @@ const SEARCH_CACHE_MAX = 50;            // 最多缓存 50 条，超出按插入
 const searchCache = new Map();
 
 function searchCacheKey(q) {
-  return currentRoot + ':' + q;
+  // 缓存必须区分「是否含文件夹名」和「搜索范围」，否则开关/范围切换会拿到另一套结果
+  return currentRoot + ':' + (searchInPathEl && searchInPathEl.checked ? '1' : '0')
+    + ':' + (searchScopeSel && searchScopeSel.value === 'all' ? 'all' : 'root') + ':' + q;
 }
 
 // 读取缓存：命中且未超 TTL 返回数据，否则返回 null
@@ -1186,6 +1214,11 @@ function setSearchCache(q, data) {
   }
 }
 
+// 主动清空搜索缓存：转码完成 / 删源 / 列表刷新后调用，避免搜索页最多 60s 仍显示旧结果
+function clearSearchCache() {
+  searchCache.clear();
+}
+
 // 防抖：停止输入 300ms 后才发起搜索
 searchInput.addEventListener('input', () => {
   clearTimeout(searchTimer);
@@ -1205,9 +1238,31 @@ searchInput.addEventListener('input', () => {
   searchTimer = setTimeout(() => doSearch(q), 300);
 });
 
+// Enter 键立即搜索：取消防抖等待，马上发起搜索（不用再等 300ms）
+searchInput.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  clearTimeout(searchTimer);
+  searchTimer = null;
+  const q = searchInput.value.trim();
+  if (q) doSearch(q);
+});
+
 // 类型过滤变化：若在搜索视图则重新渲染（前端过滤已返回结果）
 searchTypeSel.addEventListener('change', () => {
   if (searchMode) renderSearchResults();
+});
+
+// 「含文件夹名」开关变化 → 用新范围立即重搜（缓存 key 已含开关，不会取到旧结果）
+searchInPathEl.addEventListener('change', () => {
+  const q = searchInput.value.trim();
+  if (q) doSearch(q);
+});
+
+// 「搜索范围」切换（当前根 / 全部根）→ 用新范围立即重搜
+searchScopeSel.addEventListener('change', () => {
+  const q = searchInput.value.trim();
+  if (q) doSearch(q);
 });
 
 // 清除搜索：中断请求、清空输入、回到目录视图
@@ -1263,6 +1318,7 @@ async function doSearch(q) {
   searchController = controller;
   const seq = ++searchSeq;
   searchMode = true;
+  searchScopeAll = !!(searchScopeSel && searchScopeSel.value === 'all');
   searchClearBtn.style.display = 'inline-block';
 
   // 命中缓存：不请求后台，直接渲染结果（返回搜索页时秒出）
@@ -1300,7 +1356,12 @@ async function doSearch(q) {
   };
 
   try {
-    const qs = new URLSearchParams({ root: currentRoot, q });
+    const qs = new URLSearchParams({
+      root: currentRoot,
+      q,
+      inPath: (searchInPathEl && searchInPathEl.checked) ? '1' : '0',
+      scope: searchScopeAll ? 'all' : '',
+    });
     const res = await fetch('/local/api/search-stream?' + qs.toString(), { signal: controller.signal });
     if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
     const reader = res.body.getReader();
@@ -1331,12 +1392,8 @@ async function doSearch(q) {
           searchMatched = msg.matched || searchResults.length;
           searchTimedOut = !!msg.timedOut;
           searchTruncated = !!msg.truncated;
-          // 按服务端最终排序重排（流式到达顺序会让顺序看起来跳动）
-          if (Array.isArray(msg.order) && msg.order.length === searchResults.length) {
-            const byPath = new Map(searchResults.map((r) => [r.path, r]));
-            const sorted = msg.order.map((pth) => byPath.get(pth)).filter(Boolean);
-            if (sorted.length === searchResults.length) searchResults = sorted;
-          }
+          // 服务端给出最终确定的列表（已按"文件名命中优先"排序并截断）
+          if (Array.isArray(msg.results)) searchResults = msg.results;
           searchStreaming = false;
           loadingEl.style.display = 'none';
           renderSearchResults();
@@ -1460,9 +1517,12 @@ function renderSearchResults() {
   stat.style.textAlign = 'left';
   const matched = searchMatched || searchResults.length;
   let text = `🔍 找到 ${matched} 个结果`;
+  if (searchInPathEl && searchInPathEl.checked) text += '（含文件夹名）';
+  if (searchScopeAll) text += '（全部根）';
   if (type) text += `（其中 ${TYPE_LABELS[type] || type} ${list.length} 个）`;
   if (searchTimedOut) text += ' · ⚠️ 遍历超时，可能还有更多结果';
   else if (matched > searchResults.length) text += `，仅显示前 ${searchResults.length} 个，建议细化关键词`;
+  else if (searchTruncated) text += ' · 命中较多，已截断，建议细化关键词';
   stat.textContent = text;
   fileListEl.appendChild(stat);
 
@@ -1471,19 +1531,30 @@ function renderSearchResults() {
     // 访问过的文件/目录加 .visited 类（淡紫色标识）
     li.className = 'item ' + e.kind + (isVisited(e) ? ' visited' : '');
     // 文件夹也显示所在路径（否则搜出同名文件夹不知道在哪）
+    const rootPrefix = (searchScopeAll && e.rootName) ? escapeHtml(e.rootName) + ' › ' : '';
     li.innerHTML = `
       <span class="icon">${ICONS[e.kind] || '📦'}</span>
       <span class="name">${highlightMatch(e.name)}</span>
-      <span class="search-result-path" title="${escapeHtml(e.path)}">${escapeHtml(shortenPath(e.path))}</span>
+      ${e.pathOnly ? '<span class="path-badge" title="关键词命中的是上级文件夹名">路径</span>' : ''}
+      <span class="search-result-path" title="${escapeHtml((e.rootName ? e.rootName + ' › ' : '') + e.path)}">${rootPrefix}${escapeHtml(shortenPath(e.path))}</span>
       <span class="meta">${e.isDir ? '' : formatSize(e.size)}</span>
     `;
     li.onclick = () => {
-      handleClick(e);
+      openSearchResult(e);
       // 立即标记（不等刷新）：文件点击后马上变淡紫色
       if (!e.isDir) li.classList.add('visited');
     };
     fileListEl.appendChild(li);
   });
+}
+
+// 点击搜索结果：若结果来自其它根目录（全部根搜索），先把当前根切过去，再走正常点击逻辑
+function openSearchResult(e) {
+  if (e && e.rootIndex != null && e.rootIndex !== currentRoot) {
+    currentRoot = e.rootIndex;
+    document.querySelectorAll('.root-btn').forEach((b, i) => b.classList.toggle('active', i === e.rootIndex));
+  }
+  handleClick(e);
 }
 
 // 点击搜索结果进入目录时：退出搜索模式，跳到该目录
@@ -1841,12 +1912,14 @@ async function startLocalTranscode(e) {
   $('transcode-cancel-btn').style.display = 'none';
   if (res.ok) {
     $('player-hint').textContent = '✅ 转码完成，正在播放…';
+    // 转码产出/删源后：主动清掉搜索缓存，避免搜索页最多 60s 仍显示旧结果
+    clearSearchCache();
     // 按当前视图刷新：搜索模式下重搜（保持搜索页，新 .mp4 也出现在结果中）；目录模式下重载列表
     const q = (searchInput.value || '').trim();
     if (searchMode && q) {
       doSearch(q);
     } else {
-      await loadList();  // 刷新列表（新 .mp4 出现，源 .flv 保留）
+      await loadList({ invalidateSearchCache: true });  // 刷新列表（新 .mp4 出现，源 .flv 保留）
     }
     if (isStale()) return;
     currentIsFlv = false;
